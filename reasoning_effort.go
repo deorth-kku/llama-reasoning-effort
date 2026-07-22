@@ -136,6 +136,10 @@ func (m ReasoningEffort) ServeHTTP(w http.ResponseWriter, r *http.Request, next 
 		return next.ServeHTTP(w, r)
 	}
 
+	if log.Level().Enabled(zap.DebugLevel) {
+		log.Debug("full request body", zap.String("data", string(newBody)))
+	}
+
 	r.Body = io.NopCloser(bytes.NewReader(newBody))
 	r.ContentLength = int64(len(newBody))
 	r.Header.Set("Content-Length", strconv.Itoa(len(newBody)))
