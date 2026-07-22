@@ -63,7 +63,7 @@ type RequestBody struct {
 
 type kwargs struct {
 	EnableThinking cjson.Nullable[bool] `json:"enable_thinking,omitzero"`
-	Inline         jsontext.Value       `json:",inline,omitzero"`
+	Inline         jsontext.Value       `json:",inline"`
 }
 
 // CaddyModule returns the Caddy module information.
@@ -130,8 +130,7 @@ func (m ReasoningEffort) ServeHTTP(w http.ResponseWriter, r *http.Request, next 
 	newBody, err := json.Marshal(body)
 	if err != nil {
 		log.Error("failed to re-serialize request body", zap.Error(err))
-		r.Body = io.NopCloser(&bodyCopy)
-		return next.ServeHTTP(w, r)
+		return err
 	}
 
 	if log.Level().Enabled(zap.DebugLevel) {
