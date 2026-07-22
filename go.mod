@@ -4,6 +4,7 @@ go 1.26.5
 
 require (
 	github.com/caddyserver/caddy/v2 v2.11.4
+	github.com/deorth-kku/go-common v0.0.0-20260702020726-6fc9468bd8eb
 	go.uber.org/zap v1.28.0
 )
 

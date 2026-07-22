@@ -2,7 +2,8 @@ package reasoningeffort
 
 import (
 	"bytes"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	cjson "github.com/deorth-kku/go-common/json"
 	"go.uber.org/zap"
 )
 
@@ -46,6 +48,22 @@ type ReasoningEffort struct {
 	Map map[string]int64 `json:"map,omitempty"`
 
 	log *zap.Logger
+}
+
+// RequestBody is the JSON shape we care about for the transformation.
+// Fields defined explicitly are accessed by name with their Go types.
+// Fields captured via `inline` are passed through unchanged — no type
+// assertions needed for the rest of the payload.
+type RequestBody struct {
+	ReasoningEffort    string         `json:"reasoning_effort,omitzero"`
+	ChatTemplateKwargs kwargs         `json:"chat_template_kwargs,omitzero"`
+	ThinkingBudget     int64          `json:"thinking_budget_tokens,omitzero"`
+	Inline             jsontext.Value `json:",inline"`
+}
+
+type kwargs struct {
+	EnableThinking cjson.Nullable[bool] `json:"enable_thinking,omitzero"`
+	Inline         jsontext.Value       `json:",inline,omitzero"`
 }
 
 // CaddyModule returns the Caddy module information.
@@ -83,53 +101,33 @@ func (m ReasoningEffort) ServeHTTP(w http.ResponseWriter, r *http.Request, next 
 	// Read and preserve the body.
 	bodyCopy := bytes.Buffer{}
 	tee := io.TeeReader(r.Body, &bodyCopy)
-	var v any
-	if err := json.NewDecoder(tee).Decode(&v); err != nil {
-		// Invalid JSON: skip transformation, forward as-is.
-		log.Warn("skipping transformation: body is not valid json", zap.Error(err))
-		r.Body = io.NopCloser(&bodyCopy)
-		return next.ServeHTTP(w, r)
-	}
 
-	// Ensure the body is a JSON object.
-	obj, ok := v.(map[string]any)
-	if !ok {
-		log.Warn("skipping transformation: top-level json is not an object")
+	// Decode into a typed struct. The `inline` tag captures all unknown
+	// fields as a pass-through map, so we avoid type assertions for them.
+	var body RequestBody
+	if err := json.UnmarshalRead(tee, &body); err != nil {
+		log.Warn("skipping transformation: body is not valid request", zap.Error(err))
 		r.Body = io.NopCloser(&bodyCopy)
 		return next.ServeHTTP(w, r)
 	}
 
 	// Look up reasoning_effort (only when it is a string present in the map).
-	if raw, exists := obj["reasoning_effort"]; exists {
-		if level, isStr := raw.(string); isStr {
-			if budget, found := m.Map[level]; found {
-				if budget == 0 {
-					kwargs := obj["chat_template_kwargs"]
-					switch kwargs := kwargs.(type) {
-					case nil:
-						obj["chat_template_kwargs"] = map[string]any{
-							"enable_thinking": false,
-						}
-						log.Debug("setting disable-thinking via chat_template_kwargs")
-					case map[string]any:
-						kwargs["enable_thinking"] = false
-						obj["chat_template_kwargs"] = kwargs
-						log.Debug("setting disable-thinking via chat_template_kwargs")
-					default:
-						log.Warn("chat_template_kwargs is not a map, skipping", zap.Any("value", kwargs))
-					}
-				} else {
-					log.Debug("mapped reasoning_effort", zap.String("reasoning_effort", level), zap.Int64("thinking_budget_tokens", budget))
-					obj["thinking_budget_tokens"] = budget
-				}
+	if level := body.ReasoningEffort; level != "" {
+		if budget, found := m.Map[level]; found {
+			if budget == 0 {
+				log.Debug("setting disable-thinking via chat_template_kwargs")
+				body.ChatTemplateKwargs.EnableThinking = cjson.NewNullable(false)
 			} else {
-				log.Info("skipping transformation: unknown reasoning_effort value", zap.String("value", level))
+				log.Debug("mapped reasoning_effort", zap.String("reasoning_effort", level), zap.Int64("thinking_budget_tokens", budget))
+				body.ThinkingBudget = budget
 			}
+		} else {
+			log.Info("skipping transformation: unknown reasoning_effort value", zap.String("value", level))
 		}
 	}
 
 	// Re-serialize and replace the request body.
-	newBody, err := json.Marshal(obj)
+	newBody, err := json.Marshal(body)
 	if err != nil {
 		log.Error("failed to re-serialize request body", zap.Error(err))
 		r.Body = io.NopCloser(&bodyCopy)

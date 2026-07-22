@@ -2,8 +2,8 @@ package reasoningeffort
 
 import (
 	"bytes"
-	"encoding/json"
-	"io/ioutil"
+	"encoding/json/v2"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -21,7 +21,7 @@ type captureHandler struct {
 }
 
 func (c *captureHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) error {
-	c.body, _ = ioutil.ReadAll(r.Body)
+	c.body, _ = io.ReadAll(r.Body)
 	c.path = r.URL.Path
 	c.headers = r.Header.Clone()
 	w.WriteHeader(http.StatusOK)
@@ -59,7 +59,7 @@ func TestMapHitWritesBudgetAndKeepsSource(t *testing.T) {
 	m := ReasoningEffort{Path: defaultPath, Map: newTestMap()}
 	cap := runHandler(t, m, `{"model":"x","reasoning_effort":"medium"}`, defaultPath)
 
-	var got map[string]interface{}
+	var got map[string]any
 	if err := json.Unmarshal(cap.body, &got); err != nil {
 		t.Fatalf("downstream body not valid json: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestUnknownValueSkips(t *testing.T) {
 	m := ReasoningEffort{Path: defaultPath, Map: newTestMap()}
 	cap := runHandler(t, m, `{"reasoning_effort":"foo"}`, defaultPath)
 
-	var got map[string]interface{}
+	var got map[string]any
 	if err := json.Unmarshal(cap.body, &got); err != nil {
 		t.Fatalf("downstream body not valid json: %v", err)
 	}
@@ -91,7 +91,7 @@ func TestNonStringValueSkips(t *testing.T) {
 	m := ReasoningEffort{Path: defaultPath, Map: newTestMap()}
 	cap := runHandler(t, m, `{"reasoning_effort":123}`, defaultPath)
 
-	var got map[string]interface{}
+	var got map[string]any
 	_ = json.Unmarshal(cap.body, &got)
 	if _, ok := got["thinking_budget_tokens"]; ok {
 		t.Errorf("expected thinking_budget_tokens absent for non-string value, got %v", got["thinking_budget_tokens"])
@@ -115,7 +115,7 @@ func TestPathMismatchSkips(t *testing.T) {
 	m := ReasoningEffort{Path: defaultPath, Map: newTestMap()}
 	cap := runHandler(t, m, `{"reasoning_effort":"high"}`, "/other/path")
 
-	var got map[string]interface{}
+	var got map[string]any
 	_ = json.Unmarshal(cap.body, &got)
 	if _, ok := got["thinking_budget_tokens"]; ok {
 		t.Errorf("expected no transformation on path mismatch, got %v", got["thinking_budget_tokens"])
@@ -126,7 +126,7 @@ func TestNegativeBudgetValue(t *testing.T) {
 	m := ReasoningEffort{Path: defaultPath, Map: newTestMap()}
 	cap := runHandler(t, m, `{"reasoning_effort":"max"}`, defaultPath)
 
-	var got map[string]interface{}
+	var got map[string]any
 	if err := json.Unmarshal(cap.body, &got); err != nil {
 		t.Fatalf("downstream body not valid json: %v", err)
 	}
