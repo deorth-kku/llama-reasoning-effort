@@ -45,7 +45,8 @@ type ReasoningEffort struct {
 	// Map maps a reasoning_effort value (e.g. "medium") to the
 	// corresponding thinking_budget_tokens value. Must be explicitly
 	// configured; there is no built-in default mapping.
-	Map map[string]int64 `json:"map,omitempty"`
+	Map               map[string]int64 `json:"map,omitempty"`
+	ToChatTemplateKey string           `json:"to_chat_template_key,omitempty"`
 
 	log *zap.Logger
 }
@@ -58,12 +59,12 @@ type RequestBody struct {
 	ReasoningEffort    string         `json:"reasoning_effort,omitzero"`
 	ChatTemplateKwargs kwargs         `json:"chat_template_kwargs,omitzero"`
 	ThinkingBudget     int64          `json:"thinking_budget_tokens,omitzero"`
-	Inline             jsontext.Value `json:",inline"`
+	Inline             jsontext.Value `json:",embed"`
 }
 
 type kwargs struct {
 	EnableThinking cjson.Nullable[bool] `json:"enable_thinking,omitzero"`
-	Inline         jsontext.Value       `json:",inline"`
+	Inline         map[string]any       `json:",embed"`
 }
 
 // CaddyModule returns the Caddy module information.
@@ -123,6 +124,10 @@ func (m ReasoningEffort) ServeHTTP(w http.ResponseWriter, r *http.Request, next 
 			}
 		} else {
 			log.Info("skipping transformation: unknown reasoning_effort value", zap.String("value", level))
+		}
+
+		if m.ToChatTemplateKey != "" {
+			body.ChatTemplateKwargs.Inline[m.ToChatTemplateKey] = level
 		}
 	}
 

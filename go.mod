@@ -1,6 +1,6 @@
 module github.com/deorth-kku/llama-reasoning-effort
 
-go 1.26.5
+go 1.27
 
 require (
 	github.com/caddyserver/caddy/v2 v2.11.4
