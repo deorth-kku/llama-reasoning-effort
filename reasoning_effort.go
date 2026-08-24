@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
-	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -41,14 +40,17 @@ type ReasoningEffort struct {
 	// Path is the request path on which the transformation is applied.
 	// Defaults to "/v1/chat/completions".
 	Path string `json:"path,omitempty"`
+	ModelConfig
+	ModelConfigs map[string]ModelConfig `json:"model_configs,omitzero"`
+	log          *zap.Logger
+}
 
+type ModelConfig struct {
 	// Map maps a reasoning_effort value (e.g. "medium") to the
-	// corresponding thinking_budget_tokens value. Must be explicitly
-	// configured; there is no built-in default mapping.
+	// corresponding thinking_budget_tokens value. There is no built-in
+	// default mapping; values absent from the map are left unchanged.
 	Map               map[string]int64 `json:"map,omitempty"`
 	ToChatTemplateKey string           `json:"to_chat_template_key,omitempty"`
-
-	log *zap.Logger
 }
 
 // RequestBody is the JSON shape we care about for the transformation.
@@ -56,6 +58,7 @@ type ReasoningEffort struct {
 // Fields captured via `inline` are passed through unchanged — no type
 // assertions needed for the rest of the payload.
 type RequestBody struct {
+	Model              string         `json:"model,omitzero"`
 	ReasoningEffort    string         `json:"reasoning_effort,omitzero"`
 	ChatTemplateKwargs kwargs         `json:"chat_template_kwargs,omitzero"`
 	ThinkingBudget     int64          `json:"thinking_budget_tokens,omitzero"`
@@ -79,9 +82,6 @@ func (ReasoningEffort) CaddyModule() caddy.ModuleInfo {
 func (m *ReasoningEffort) Provision(ctx caddy.Context) error {
 	if m.Path == "" {
 		m.Path = defaultPath
-	}
-	if len(m.Map) == 0 {
-		return fmt.Errorf("reasoning_effort: a non-empty 'map' must be configured")
 	}
 	m.log = ctx.Logger(m)
 	return nil
@@ -112,9 +112,14 @@ func (m ReasoningEffort) ServeHTTP(w http.ResponseWriter, r *http.Request, next 
 		return next.ServeHTTP(w, r)
 	}
 
-	// Look up reasoning_effort (only when it is a string present in the map).
+	useconfig, ok := m.ModelConfigs[body.Model]
+	if !ok {
+		useconfig = m.ModelConfig
+	}
+
 	if level := body.ReasoningEffort; level != "" {
-		if budget, found := m.Map[level]; found {
+		// Look up reasoning_effort (only when it is a string present in the map).
+		if budget, found := useconfig.Map[level]; found {
 			if budget == 0 {
 				log.Debug("setting disable-thinking via chat_template_kwargs")
 				body.ChatTemplateKwargs.EnableThinking = cjson.NewNullable(false)
@@ -122,12 +127,17 @@ func (m ReasoningEffort) ServeHTTP(w http.ResponseWriter, r *http.Request, next 
 				log.Debug("mapped reasoning_effort", zap.String("reasoning_effort", level), zap.Int64("thinking_budget_tokens", budget))
 				body.ThinkingBudget = budget
 			}
-		} else {
+		} else if len(useconfig.Map) > 0 {
+			// Only log when a map is configured; otherwise the value is
+			// simply not mapped and there is nothing to report.
 			log.Info("skipping transformation: unknown reasoning_effort value", zap.String("value", level))
 		}
 
-		if m.ToChatTemplateKey != "" {
-			body.ChatTemplateKwargs.Inline[m.ToChatTemplateKey] = level
+		if useconfig.ToChatTemplateKey != "" {
+			if body.ChatTemplateKwargs.Inline == nil {
+				body.ChatTemplateKwargs.Inline = make(map[string]any)
+			}
+			body.ChatTemplateKwargs.Inline[useconfig.ToChatTemplateKey] = level
 		}
 	}
 
@@ -176,12 +186,76 @@ func (m *ReasoningEffort) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.Errf("invalid thinking_budget_tokens value '%s': %v", d.Val(), err)
 				}
 				m.Map[key] = val
+			case "to_chat_template_key":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				m.ToChatTemplateKey = d.Val()
+			case "model":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				modelName := d.Val()
+				mc, err := parseModelConfigBlock(d)
+				if err != nil {
+					return err
+				}
+				if m.ModelConfigs == nil {
+					m.ModelConfigs = map[string]ModelConfig{}
+				}
+				m.ModelConfigs[modelName] = mc
 			default:
 				return d.Errf("unexpected token '%s'", d.Val())
 			}
 		}
 	}
 	return nil
+}
+
+// parseModelConfigBlock parses a `model <name> { ... }` block into a
+// ModelConfig. The dispenser must be positioned at the model name token,
+// with the block opening brace on the same line. Only `map` and
+// `to_chat_template_key` are allowed inside a model block.
+func parseModelConfigBlock(d *caddyfile.Dispenser) (ModelConfig, error) {
+	var mc ModelConfig
+	// The dispenser is positioned on the model name token, with the
+	// block-opening brace on the same line. The first NextBlock call both
+	// opens the block and lands on the first content token; subsequent
+	// calls advance until the matching closing brace is reached.
+	level := d.Nesting()
+	if !d.NextBlock(level) {
+		return mc, d.Errf("model config requires a '{ ... }' block")
+	}
+	for {
+		switch d.Val() {
+		case "map":
+			if !d.NextArg() {
+				return mc, d.ArgErr()
+			}
+			key := d.Val()
+			if !d.NextArg() {
+				return mc, d.ArgErr()
+			}
+			val, err := strconv.ParseInt(d.Val(), 10, 64)
+			if err != nil {
+				return mc, d.Errf("invalid thinking_budget_tokens value '%s': %v", d.Val(), err)
+			}
+			if mc.Map == nil {
+				mc.Map = map[string]int64{}
+			}
+			mc.Map[key] = val
+		case "to_chat_template_key":
+			if !d.NextArg() {
+				return mc, d.ArgErr()
+			}
+			mc.ToChatTemplateKey = d.Val()
+		default:
+			return mc, d.Errf("unexpected token '%s' in model config", d.Val())
+		}
+		if !d.NextBlock(level) {
+			return mc, nil
+		}
+	}
 }
 
 // parseCaddyfile unmarshals tokens from h into a new Middleware.

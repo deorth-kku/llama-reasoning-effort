@@ -295,3 +295,147 @@ func TestExtraFieldsPassthrough(t *testing.T) {
 		t.Errorf("expected extra_nested.a.b=1, got %v", ab["b"])
 	}
 }
+
+func TestUnmarshalCaddyfileToChatTemplateKey(t *testing.T) {
+	input := `reasoning_effort {
+		to_chat_template_key effort
+		map medium 2048
+	}`
+	d := caddyfile.NewTestDispenser(input)
+	var m ReasoningEffort
+	if err := m.UnmarshalCaddyfile(d); err != nil {
+		t.Fatalf("UnmarshalCaddyfile error: %v", err)
+	}
+	if m.ToChatTemplateKey != "effort" {
+		t.Errorf("expected to_chat_template_key=effort, got %q", m.ToChatTemplateKey)
+	}
+}
+
+func TestUnmarshalCaddyfileModelBlock(t *testing.T) {
+	input := `reasoning_effort {
+		to_chat_template_key effort
+		map medium 2048
+		model llama-4 {
+			to_chat_template_key effort
+			map medium 4096
+		}
+	}`
+	d := caddyfile.NewTestDispenser(input)
+	var m ReasoningEffort
+	if err := m.UnmarshalCaddyfile(d); err != nil {
+		t.Fatalf("UnmarshalCaddyfile error: %v", err)
+	}
+
+	// Top-level config is untouched by the model block.
+	if m.ToChatTemplateKey != "effort" {
+		t.Errorf("expected default to_chat_template_key=effort, got %q", m.ToChatTemplateKey)
+	}
+	if m.Map["medium"] != 2048 {
+		t.Errorf("expected default map[medium]=2048, got %d", m.Map["medium"])
+	}
+
+	mc, ok := m.ModelConfigs["llama-4"]
+	if !ok {
+		t.Fatalf("expected llama-4 in ModelConfigs, got %#v", m.ModelConfigs)
+	}
+	if mc.ToChatTemplateKey != "effort" {
+		t.Errorf("expected model to_chat_template_key=effort, got %q", mc.ToChatTemplateKey)
+	}
+	if mc.Map["medium"] != 4096 {
+		t.Errorf("expected model map[medium]=4096, got %d", mc.Map["medium"])
+	}
+}
+
+func TestUnmarshalCaddyfileModelBlockMissingBraces(t *testing.T) {
+	input := `reasoning_effort {
+		model llama-4
+	}`
+	d := caddyfile.NewTestDispenser(input)
+	var m ReasoningEffort
+	if err := m.UnmarshalCaddyfile(d); err == nil {
+		t.Fatal("expected error for model block without braces, got nil")
+	}
+}
+
+func TestUnmarshalCaddyfileModelBlockUnexpectedToken(t *testing.T) {
+	input := `reasoning_effort {
+		model llama-4 {
+			foobar 123
+		}
+	}`
+	d := caddyfile.NewTestDispenser(input)
+	var m ReasoningEffort
+	if err := m.UnmarshalCaddyfile(d); err == nil {
+		t.Fatal("expected error for unexpected token in model block, got nil")
+	}
+}
+
+func TestUnmarshalCaddyfileModelBlockInvalidValue(t *testing.T) {
+	input := `reasoning_effort {
+		model llama-4 {
+			map medium notanumber
+		}
+	}`
+	d := caddyfile.NewTestDispenser(input)
+	var m ReasoningEffort
+	if err := m.UnmarshalCaddyfile(d); err == nil {
+		t.Fatal("expected error for invalid budget value in model block, got nil")
+	}
+}
+
+// TestModelConfigOverride verifies that a per-model config selected by the
+// request's model field is used instead of the default config.
+func TestModelConfigOverride(t *testing.T) {
+	m := ReasoningEffort{
+		Path: defaultPath,
+		Map:  newTestMap(),
+	}
+	m.ModelConfigs = map[string]ModelConfig{
+		"llama-4": {
+			Map:               map[string]int64{"medium": 4096},
+			ToChatTemplateKey: "effort",
+		},
+	}
+	cap := runHandler(t, m, `{"model":"llama-4","reasoning_effort":"medium"}`, defaultPath)
+
+	var got map[string]any
+	if err := json.Unmarshal(cap.body, &got); err != nil {
+		t.Fatalf("downstream body not valid json: %v", err)
+	}
+	if got["thinking_budget_tokens"] != float64(4096) {
+		t.Errorf("expected thinking_budget_tokens=4096 from model config, got %v", got["thinking_budget_tokens"])
+	}
+	if got["reasoning_effort"] != "medium" {
+		t.Errorf("expected reasoning_effort preserved, got %v", got["reasoning_effort"])
+	}
+	// to_chat_template_key from the model config should have been applied.
+	kwargs, ok := got["chat_template_kwargs"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected chat_template_kwargs to be an object, got %v", got["chat_template_kwargs"])
+	}
+	if kwargs["effort"] != "medium" {
+		t.Errorf("expected chat_template_kwargs.effort=medium, got %v", kwargs["effort"])
+	}
+}
+
+// TestModelConfigFallback verifies that a model not present in ModelConfigs
+// falls back to the default (top-level) config.
+func TestModelConfigFallback(t *testing.T) {
+	m := ReasoningEffort{
+		Path: defaultPath,
+		Map:  newTestMap(),
+	}
+	m.ModelConfigs = map[string]ModelConfig{
+		"llama-4": {Map: map[string]int64{"medium": 4096}},
+	}
+	// "other" model has no per-model config -> uses default.
+	cap := runHandler(t, m, `{"model":"other","reasoning_effort":"medium"}`, defaultPath)
+
+	var got map[string]any
+	if err := json.Unmarshal(cap.body, &got); err != nil {
+		t.Fatalf("downstream body not valid json: %v", err)
+	}
+	if got["thinking_budget_tokens"] != float64(2048) {
+		t.Errorf("expected thinking_budget_tokens=2048 from default config, got %v", got["thinking_budget_tokens"])
+	}
+}
