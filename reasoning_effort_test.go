@@ -2,14 +2,18 @@ package reasoningeffort
 
 import (
 	"bytes"
+	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"go.uber.org/zap"
@@ -312,6 +316,7 @@ func TestUnmarshalCaddyfileToChatTemplateKey(t *testing.T) {
 		to_chat_template_key effort
 		map medium 2048
 	}`
+
 	d := caddyfile.NewTestDispenser(input)
 	var m ReasoningEffort
 	if err := m.UnmarshalCaddyfile(d); err != nil {
@@ -485,5 +490,550 @@ func TestDebugLogDataFieldIsJSONObject(t *testing.T) {
 	}
 	if data["thinking_budget_tokens"] != float64(2048) {
 		t.Errorf("expected data.thinking_budget_tokens=2048, got %v", data["thinking_budget_tokens"])
+	}
+}
+
+// hookRequest records the details of a single request received by a
+// hookRecorder.
+type hookRequest struct {
+	method      string
+	body        []byte
+	contentType string
+	path        string
+}
+
+// hookRecorder is an httptest server that records every request it receives
+// in order, and signals via the signal channel after each request so tests
+// can wait for arrival without flaky sleeps.
+type hookRecorder struct {
+	mu       sync.Mutex
+	requests []hookRequest
+	signal   chan struct{}
+}
+
+func newHookRecorder() *hookRecorder {
+	return &hookRecorder{signal: make(chan struct{}, 64)}
+}
+
+func (r *hookRecorder) handler(w http.ResponseWriter, req *http.Request) {
+	body, _ := io.ReadAll(req.Body)
+	r.mu.Lock()
+	r.requests = append(r.requests, hookRequest{
+		method:      req.Method,
+		body:        body,
+		contentType: req.Header.Get("Content-Type"),
+		path:        req.URL.Path,
+	})
+	r.mu.Unlock()
+	r.signal <- struct{}{}
+	w.WriteHeader(http.StatusOK)
+}
+
+// wait blocks until n requests have been received, or times out.
+func (r *hookRecorder) wait(t *testing.T, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		select {
+		case <-r.signal:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for hook request %d/%d", i+1, n)
+		}
+	}
+}
+
+func (r *hookRecorder) snapshot() []hookRequest {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]hookRequest, len(r.requests))
+	copy(out, r.requests)
+	return out
+}
+
+func (r *hookRecorder) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.requests)
+}
+
+// TestHookFiresOnMatchingPath verifies a top-level http hook fires for a
+// request to the configured path, with the ORIGINAL (pre-transformation)
+// request body.
+func TestHookFiresOnMatchingPath(t *testing.T) {
+	rec := newHookRecorder()
+	srv := httptest.NewServer(http.HandlerFunc(rec.handler))
+	defer srv.Close()
+
+	const original = `{"model":"x","reasoning_effort":"medium","keepme":true}`
+	m := ReasoningEffort{
+		Path: defaultPath,
+		Map:  newTestMap(),
+		Hooks: []Hook{{
+			Type: "http",
+			URL:  srv.URL,
+			// Reference the original request body via placeholder.
+			Body: "{http.request.body}",
+		}},
+	}
+	runHandler(t, m, original, defaultPath)
+	rec.wait(t, 1)
+
+	got := rec.snapshot()[0]
+	if got.method != http.MethodPost {
+		t.Errorf("expected hook method POST, got %q", got.method)
+	}
+	if string(got.body) != original {
+		t.Errorf("expected hook to receive original body (not transformed), got %q", string(got.body))
+	}
+}
+
+// TestMultipleHooksAllFire verifies every http hook in the array fires.
+func TestMultipleHooksAllFire(t *testing.T) {
+	recA := newHookRecorder()
+	srvA := httptest.NewServer(http.HandlerFunc(recA.handler))
+	defer srvA.Close()
+	recB := newHookRecorder()
+	srvB := httptest.NewServer(http.HandlerFunc(recB.handler))
+	defer srvB.Close()
+
+	m := ReasoningEffort{
+		Path: defaultPath,
+		Map:  newTestMap(),
+		Hooks: []Hook{
+			{Type: "http", URL: srvA.URL},
+			{Type: "http", URL: srvB.URL},
+		},
+	}
+
+	runHandler(t, m, `{"reasoning_effort":"high"}`, defaultPath)
+	recA.wait(t, 1)
+	recB.wait(t, 1)
+}
+
+// TestMultipleHooksFireInOrder verifies blocking hooks fire in array order.
+func TestMultipleHooksFireInOrder(t *testing.T) {
+	rec := newHookRecorder()
+	srv := httptest.NewServer(http.HandlerFunc(rec.handler))
+	defer srv.Close()
+
+	m := ReasoningEffort{
+		Path: defaultPath,
+		Map:  newTestMap(),
+		Hooks: []Hook{
+			{Type: "http", URL: srv.URL, Body: "first", Blocking: true},
+			{Type: "http", URL: srv.URL, Body: "second", Blocking: true},
+		},
+	}
+
+	runHandler(t, m, `{"reasoning_effort":"high"}`, defaultPath)
+	rec.wait(t, 2)
+
+	got := rec.snapshot()
+	if string(got[0].body) != "first" {
+		t.Errorf("expected first hook body 'first', got %q", string(got[0].body))
+	}
+	if string(got[1].body) != "second" {
+		t.Errorf("expected second hook body 'second', got %q", string(got[1].body))
+	}
+}
+
+// TestHookPerModelOverride verifies a per-model hooks array is selected over
+// the top-level hooks array (full override).
+func TestHookPerModelOverride(t *testing.T) {
+	recA := newHookRecorder()
+	srvA := httptest.NewServer(http.HandlerFunc(recA.handler))
+	defer srvA.Close()
+	recB := newHookRecorder()
+	srvB := httptest.NewServer(http.HandlerFunc(recB.handler))
+	defer srvB.Close()
+
+	m := ReasoningEffort{
+		Path:  defaultPath,
+		Map:   newTestMap(),
+		Hooks: []Hook{{Type: "http", URL: srvB.URL}},
+		ModelConfigs: map[string]ModelConfig{
+			"llama-4": {Hooks: []Hook{{Type: "http", URL: srvA.URL}}},
+		},
+	}
+
+	// model llama-4 -> per-model hook (srvA).
+	runHandler(t, m, `{"model":"llama-4","reasoning_effort":"medium"}`, defaultPath)
+	recA.wait(t, 1)
+
+	// unknown model -> top-level hook (srvB).
+	runHandler(t, m, `{"model":"other","reasoning_effort":"medium"}`, defaultPath)
+	recB.wait(t, 1)
+
+	if recA.count() != 1 {
+		t.Errorf("expected srvA (per-model) hit once, got %d", recA.count())
+	}
+	if recB.count() != 1 {
+		t.Errorf("expected srvB (top-level) hit once, got %d", recB.count())
+	}
+}
+
+// TestHookSkippedOnNonMatchingPath verifies hooks do not fire for paths that
+// do not match the configured path.
+func TestHookSkippedOnNonMatchingPath(t *testing.T) {
+	rec := newHookRecorder()
+	srv := httptest.NewServer(http.HandlerFunc(rec.handler))
+	defer srv.Close()
+
+	m := ReasoningEffort{
+		Path:  defaultPath,
+		Map:   newTestMap(),
+		Hooks: []Hook{{Type: "http", URL: srv.URL}},
+	}
+
+	runHandler(t, m, `{"reasoning_effort":"high"}`, "/other/path")
+	// Give any (spurious) async hook a chance to fire before asserting.
+	time.Sleep(200 * time.Millisecond)
+	if rec.count() != 0 {
+		t.Errorf("expected no hook hit on non-matching path, got %d", rec.count())
+	}
+}
+
+// TestHookFailureDoesNotBreakRequest verifies a failing hook (500) does not
+// prevent the downstream request, and that remaining hooks in the array still
+// fire.
+func TestHookFailureDoesNotBreakRequest(t *testing.T) {
+	// Hook server that always returns 500.
+	failSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer failSrv.Close()
+
+	// A second, healthy hook that must still fire.
+	rec := newHookRecorder()
+	okSrv := httptest.NewServer(http.HandlerFunc(rec.handler))
+	defer okSrv.Close()
+
+	m := ReasoningEffort{
+		Path: defaultPath,
+		Map:  newTestMap(),
+		Hooks: []Hook{
+			{Type: "http", URL: failSrv.URL},
+			{Type: "http", URL: okSrv.URL},
+		},
+	}
+
+	cap := runHandler(t, m, `{"reasoning_effort":"high"}`, defaultPath)
+	if cap.body == nil {
+		t.Fatal("expected downstream handler to run")
+	}
+	rec.wait(t, 1)
+}
+
+// TestHookBodyJSONWinsOverString verifies that when both body_json and body
+// are set, the JSON body wins and is sent with Content-Type application/json.
+func TestHookBodyJSONWinsOverString(t *testing.T) {
+	rec := newHookRecorder()
+	srv := httptest.NewServer(http.HandlerFunc(rec.handler))
+	defer srv.Close()
+
+	m := ReasoningEffort{
+		Path: defaultPath,
+		Map:  newTestMap(),
+		Hooks: []Hook{{
+			Type:     "http",
+			URL:      srv.URL,
+			Body:     "string-body",
+			BodyJSON: jsontext.Value(`{"json":true}`),
+		}},
+	}
+
+	runHandler(t, m, `{"reasoning_effort":"high"}`, defaultPath)
+	rec.wait(t, 1)
+
+	got := rec.snapshot()[0]
+	if string(got.body) != `{"json":true}` {
+		t.Errorf("expected JSON body to win, got %q", string(got.body))
+	}
+	if got.contentType != "application/json" {
+		t.Errorf("expected Content-Type application/json, got %q", got.contentType)
+	}
+}
+
+// TestHookStringBodyContentType verifies the string body honors a custom
+// content_type, and falls back to the default when none is set.
+func TestHookStringBodyContentType(t *testing.T) {
+	recCustom := newHookRecorder()
+	srvCustom := httptest.NewServer(http.HandlerFunc(recCustom.handler))
+	defer srvCustom.Close()
+
+	m := ReasoningEffort{
+		Path: defaultPath,
+		Map:  newTestMap(),
+		Hooks: []Hook{{
+			Type:        "http",
+			URL:         srvCustom.URL,
+			Body:        "hello",
+			ContentType: "application/xml",
+		}},
+	}
+	runHandler(t, m, `{"reasoning_effort":"high"}`, defaultPath)
+	recCustom.wait(t, 1)
+	if got := recCustom.snapshot()[0]; got.contentType != "application/xml" {
+		t.Errorf("expected custom Content-Type application/xml, got %q", got.contentType)
+	}
+}
+
+// TestHookDefaultContentType verifies the string body defaults to
+// text/plain; charset=utf-8 when no content_type is set.
+func TestHookDefaultContentType(t *testing.T) {
+	rec := newHookRecorder()
+	srv := httptest.NewServer(http.HandlerFunc(rec.handler))
+	defer srv.Close()
+
+	m := ReasoningEffort{
+		Path: defaultPath,
+		Map:  newTestMap(),
+		Hooks: []Hook{{
+			Type: "http",
+			URL:  srv.URL,
+			Body: "hello",
+		}},
+	}
+	runHandler(t, m, `{"reasoning_effort":"high"}`, defaultPath)
+	rec.wait(t, 1)
+	if got := rec.snapshot()[0]; got.contentType != defaultHookContentType {
+		t.Errorf("expected default Content-Type %q, got %q", defaultHookContentType, got.contentType)
+	}
+}
+
+// TestHookStringBodyPlaceholder verifies Caddy placeholder substitution in the
+// string body template.
+func TestHookStringBodyPlaceholder(t *testing.T) {
+	rec := newHookRecorder()
+	srv := httptest.NewServer(http.HandlerFunc(rec.handler))
+	defer srv.Close()
+
+	m := ReasoningEffort{
+		Path: defaultPath,
+		Map:  newTestMap(),
+		Hooks: []Hook{{
+			Type: "http",
+			URL:  srv.URL,
+			Body: "host={http.request.host}",
+		}},
+	}
+	// httptest.NewRequest sets Host from the URL.
+	runHandler(t, m, `{"reasoning_effort":"high"}`, "http://example.test/v1/chat/completions")
+	rec.wait(t, 1)
+
+	got := rec.snapshot()[0]
+	if !strings.Contains(string(got.body), "example.test") {
+		t.Errorf("expected placeholder to resolve to host example.test, got %q", string(got.body))
+	}
+}
+
+// TestHookBlocking verifies a blocking hook completes before the downstream
+// handler runs.
+func TestHookBlocking(t *testing.T) {
+	proceed := make(chan struct{})
+	rec := newHookRecorder()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-proceed // block until the test allows the hook to respond
+		rec.handler(w, r)
+	}))
+	defer srv.Close()
+
+	m := ReasoningEffort{
+		Path: defaultPath,
+		Map:  newTestMap(),
+		Hooks: []Hook{{
+			Type:     "http",
+			URL:      srv.URL,
+			Body:     "blocked",
+			Blocking: true,
+		}},
+	}
+
+	downstreamCalled := make(chan struct{})
+	req := httptest.NewRequest(http.MethodPost, defaultPath, bytes.NewBufferString(`{"reasoning_effort":"high"}`))
+	req.Header.Set("Content-Length", strconv.Itoa(len(`{"reasoning_effort":"high"}`)))
+	recorder := httptest.NewRecorder()
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		close(downstreamCalled)
+		w.WriteHeader(http.StatusOK)
+		return nil
+	})
+
+	go func() {
+		_ = m.ServeHTTP(recorder, req, next)
+	}()
+
+	// The middleware should be blocked inside the hook; downstream has not
+	// run yet.
+	time.Sleep(100 * time.Millisecond)
+	select {
+	case <-downstreamCalled:
+		t.Fatal("downstream ran before blocking hook completed")
+	default:
+	}
+
+	// Let the hook respond; downstream should now complete.
+	close(proceed)
+	select {
+	case <-downstreamCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("downstream never completed after hook proceeded")
+	}
+	rec.wait(t, 1)
+}
+
+// TestHookInvalidJSONDoesNotFire verifies that when the request body is
+// invalid JSON, the transformation is skipped and no hooks fire.
+func TestHookInvalidJSONDoesNotFire(t *testing.T) {
+	rec := newHookRecorder()
+	srv := httptest.NewServer(http.HandlerFunc(rec.handler))
+	defer srv.Close()
+
+	m := ReasoningEffort{
+		Path: defaultPath,
+		Map:  newTestMap(),
+		Hooks: []Hook{{
+			Type: "http",
+			URL:  srv.URL,
+			Body: "fired",
+		}},
+	}
+
+	cap := runHandler(t, m, `{not valid json`, defaultPath)
+	if string(cap.body) != `{not valid json` {
+		t.Errorf("expected original body forwarded on invalid JSON, got %q", string(cap.body))
+	}
+	// Give any (spurious) async hook a chance to fire before asserting.
+	time.Sleep(200 * time.Millisecond)
+	if rec.count() != 0 {
+		t.Errorf("expected no hook hit on invalid JSON, got %d", rec.count())
+	}
+}
+
+// TestProvisionHookValidation verifies Provision rejects invalid hook configs.
+func TestProvisionHookValidation(t *testing.T) {
+	tests := []struct {
+		name  string
+		hooks []Hook
+	}{
+		{"missing type", []Hook{{URL: "http://x"}}},
+		{"unknown type", []Hook{{Type: "grpc", URL: "http://x"}}},
+		{"http without url", []Hook{{Type: "http"}}},
+		{"command not supported", []Hook{{Type: "command", Command: "echo hi"}}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := ReasoningEffort{Path: defaultPath, Hooks: tc.hooks}
+			if err := m.Provision(caddy.Context{}); err == nil {
+				t.Fatalf("expected Provision error for %#v", tc.hooks)
+			}
+		})
+	}
+}
+
+// TestProvisionValidHooks verifies Provision accepts valid hook configs.
+func TestProvisionValidHooks(t *testing.T) {
+	m := ReasoningEffort{
+		Path: defaultPath,
+		Hooks: []Hook{{
+			Type: "http",
+			URL:  "http://example.test/hook",
+		}},
+		ModelConfigs: map[string]ModelConfig{
+			"llama-4": {Hooks: []Hook{{Type: "http", URL: "http://example.test/model-hook"}}},
+		},
+	}
+	if err := m.Provision(caddy.Context{}); err != nil {
+		t.Fatalf("expected valid hooks, got error: %v", err)
+	}
+	if m.hookClient == nil {
+		t.Error("expected hookClient to be initialized in Provision")
+	}
+}
+
+// TestUnmarshalCaddyfileHook verifies parsing of top-level and per-model hook
+// directives, including multiple hooks appended to the array.
+func TestUnmarshalCaddyfileHook(t *testing.T) {
+	input := `reasoning_effort {
+		map medium 2048
+		hook http http://example.test/hook {
+			method POST
+			body '{"reasoning_effort":"{{.Request.Body}}"}'
+			content_type application/json
+			timeout 5s
+			blocking
+		}
+		hook http http://example.test/hook2
+		model llama-4 {
+			map medium 4096
+			hook http http://example.test/model-hook {
+				method PUT
+				body "model-hook"
+				timeout 10s
+			}
+		}
+	}`
+
+	d := caddyfile.NewTestDispenser(input)
+	var m ReasoningEffort
+	if err := m.UnmarshalCaddyfile(d); err != nil {
+		t.Fatalf("UnmarshalCaddyfile error: %v", err)
+	}
+
+	if len(m.Hooks) != 2 {
+		t.Fatalf("expected 2 top-level hooks, got %d", len(m.Hooks))
+	}
+	if m.Hooks[0].Type != "http" {
+		t.Errorf("expected hook type http, got %q", m.Hooks[0].Type)
+	}
+	if m.Hooks[0].URL != "http://example.test/hook" {
+		t.Errorf("unexpected hook URL: %q", m.Hooks[0].URL)
+	}
+	if m.Hooks[0].Method != "POST" {
+		t.Errorf("expected method POST, got %q", m.Hooks[0].Method)
+	}
+	if m.Hooks[0].ContentType != "application/json" {
+		t.Errorf("expected content_type application/json, got %q", m.Hooks[0].ContentType)
+	}
+	if m.Hooks[0].Timeout != 5*time.Second {
+		t.Errorf("expected timeout 5s, got %v", m.Hooks[0].Timeout)
+	}
+	if !m.Hooks[0].Blocking {
+		t.Error("expected blocking=true")
+	}
+	if m.Hooks[0].Body == "" {
+		t.Error("expected string body to be parsed")
+	}
+	if m.Hooks[0].BodyJSON != nil {
+		t.Error("expected BodyJSON to be empty in Caddyfile parsing")
+	}
+	if m.Hooks[1].URL != "http://example.test/hook2" {
+		t.Errorf("expected second hook URL, got %q", m.Hooks[1].URL)
+	}
+
+	mc, ok := m.ModelConfigs["llama-4"]
+	if !ok {
+		t.Fatalf("expected llama-4 in ModelConfigs")
+	}
+	if len(mc.Hooks) != 1 {
+		t.Fatalf("expected 1 hook for model llama-4, got %d", len(mc.Hooks))
+	}
+	if mc.Hooks[0].Method != "PUT" {
+		t.Errorf("expected model hook method PUT, got %q", mc.Hooks[0].Method)
+	}
+	if mc.Hooks[0].Timeout != 10*time.Second {
+		t.Errorf("expected model hook timeout 10s, got %v", mc.Hooks[0].Timeout)
+	}
+}
+
+// TestUnmarshalCaddyfileHookUnsupportedType verifies a non-http hook type in
+// the Caddyfile is rejected.
+func TestUnmarshalCaddyfileHookUnsupportedType(t *testing.T) {
+	input := `reasoning_effort {
+		hook grpc http://example.test
+	}`
+	d := caddyfile.NewTestDispenser(input)
+	var m ReasoningEffort
+	if err := m.UnmarshalCaddyfile(d); err == nil {
+		t.Fatal("expected error for unsupported hook type in Caddyfile, got nil")
 	}
 }
