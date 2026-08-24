@@ -7,11 +7,22 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
+
+// newDebugJSONLogger returns a zap logger that writes JSON-encoded entries at
+// debug level to the provided buffer.
+func newDebugJSONLogger(buf *bytes.Buffer) *zap.Logger {
+	encoder := zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig())
+	core := zapcore.NewCore(encoder, zapcore.AddSync(buf), zapcore.DebugLevel)
+	return zap.New(core)
+}
 
 // captureHandler records the request body it receives for assertions.
 type captureHandler struct {
@@ -437,5 +448,42 @@ func TestModelConfigFallback(t *testing.T) {
 	}
 	if got["thinking_budget_tokens"] != float64(2048) {
 		t.Errorf("expected thinking_budget_tokens=2048 from default config, got %v", got["thinking_budget_tokens"])
+	}
+}
+
+// TestDebugLogDataFieldIsJSONObject verifies that the debug log for the full
+// request body emits the "data" field as a nested JSON object rather than an
+// escaped JSON string.
+func TestDebugLogDataFieldIsJSONObject(t *testing.T) {
+	var buf bytes.Buffer
+	logger := newDebugJSONLogger(&buf)
+
+	m := ReasoningEffort{Path: defaultPath, Map: newTestMap(), log: logger}
+
+	// "medium" maps to a non-zero budget, which mutates body before it is
+	// logged, so we can assert on the transformed value.
+	runHandler(t, m, `{"model":"x","reasoning_effort":"medium"}`, defaultPath)
+
+	// zap emits newline-delimited JSON (JSONL); the full-body debug entry is
+	// the last line written by the middleware.
+	lines := strings.TrimSpace(buf.String())
+	lastLine := lines[strings.LastIndex(lines, "\n")+1:]
+
+	var logLine map[string]any
+	if err := json.Unmarshal([]byte(lastLine), &logLine); err != nil {
+		t.Fatalf("log output not valid json: %v\nlog was: %s", err, buf.String())
+	}
+
+	data, ok := logLine["data"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected data field to be a JSON object, got type %T: %v",
+			logLine["data"], logLine["data"])
+	}
+
+	if data["reasoning_effort"] != "medium" {
+		t.Errorf("expected data.reasoning_effort=medium, got %v", data["reasoning_effort"])
+	}
+	if data["thinking_budget_tokens"] != float64(2048) {
+		t.Errorf("expected data.thinking_budget_tokens=2048, got %v", data["thinking_budget_tokens"])
 	}
 }

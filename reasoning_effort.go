@@ -149,7 +149,7 @@ func (m ReasoningEffort) ServeHTTP(w http.ResponseWriter, r *http.Request, next 
 	}
 
 	if log.Level().Enabled(zap.DebugLevel) {
-		log.Debug("full request body", zap.String("data", string(newBody)))
+		log.Debug("full request body", zap.Any("data", body))
 	}
 
 	r.Body = io.NopCloser(bytes.NewReader(newBody))
