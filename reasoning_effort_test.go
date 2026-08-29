@@ -154,7 +154,7 @@ func TestContentLengthUpdated(t *testing.T) {
 	m := ReasoningEffort{Path: defaultPath, Map: newTestMap()}
 	cap := runHandler(t, m, `{"reasoning_effort":"high"}`, defaultPath)
 
-	want := strconv.Itoa(len(cap.body))
+	want := ""
 	if got := cap.headers.Get("Content-Length"); got != want {
 		t.Errorf("expected Content-Length %q, got %q", want, got)
 	}

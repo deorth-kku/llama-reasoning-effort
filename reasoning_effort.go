@@ -186,6 +186,7 @@ func (m ReasoningEffort) ServeHTTP(w http.ResponseWriter, r *http.Request, next 
 	// fields as a pass-through map, so we avoid type assertions for them.
 	var body RequestBody
 	if err := json.UnmarshalRead(tee, &body); err != nil {
+		io.Copy(io.Discard, tee)
 		log.Warn("skipping transformation: body is not valid request", zap.Error(err))
 		r.Body = io.NopCloser(&bodyCopy)
 		return next.ServeHTTP(w, r)
@@ -230,20 +231,14 @@ func (m ReasoningEffort) ServeHTTP(w http.ResponseWriter, r *http.Request, next 
 		}
 	}
 
-	// Re-serialize and replace the request body.
-	newBody, err := json.Marshal(body)
-	if err != nil {
-		log.Error("failed to re-serialize request body", zap.Error(err))
-		return err
-	}
-
 	if log.Level().Enabled(zap.DebugLevel) {
 		log.Debug("full request body", zap.Any("data", body))
 	}
 
-	r.Body = io.NopCloser(bytes.NewReader(newBody))
-	r.ContentLength = int64(len(newBody))
-	r.Header.Set("Content-Length", strconv.Itoa(len(newBody)))
+	r.Body = io.NopCloser(cjson.NewJsonReader(body))
+	// llama.cpp supports unknown content length, so we can save some time by not allocating the full json body as bytes
+	r.ContentLength = -1
+	r.Header.Del("Content-Length")
 
 	return next.ServeHTTP(w, r)
 }
