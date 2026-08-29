@@ -63,6 +63,7 @@ Or use JSON config:
 | Option | Type | Description |
 | --- | --- | --- |
 | `path` | string | The request path on which the transformation is applied. Defaults to `/v1/chat/completions`. |
+| `models_path` | string | The request path for the llama.cpp `/v1/models` listing. See [/v1/models meta.n_ctx injection](#v1-models-meta_ctx-injection). Defaults to `/v1/models`. |
 | `map` | string → int | Maps a `reasoning_effort` value to the `thinking_budget_tokens` value. A value of `0` sets `chat_template_kwargs.enable_thinking` to `false` instead. |
 | `to_chat_template_key` | string | If set, the `reasoning_effort` value is also written into `chat_template_kwargs` under this key. |
 | `model_configs` | model name → config | Per-model overrides. Each entry supports the same `map`, `to_chat_template_key`, and `hooks` options as the top level. |
@@ -85,6 +86,29 @@ model llama-4 {
 4. If the `reasoning_effort` value matches an entry in the config's `map`, the corresponding `thinking_budget_tokens` is set. A budget of `0` instead sets `chat_template_kwargs.enable_thinking` to `false`.
 5. If `to_chat_template_key` is set, the `reasoning_effort` value is also written into `chat_template_kwargs` under that key.
 6. If the JSON is invalid or the top-level object doesn't contain `reasoning_effort`, the request is forwarded unchanged.
+
+## /v1/models meta.n_ctx injection
+
+llama-server's `/v1/models` listing only includes a `meta` block (with `n_ctx`) for **loaded** models. Unloaded models are reported with a `status.args` array that contains the server's launch flags, including `--ctx-size`, but no `meta`.
+
+When a response arrives at the configured `models_path` (default `/v1/models`), the plugin synthesizes `meta.n_ctx` for every model that lacks it, reading the context size from the `--ctx-size` flag in `status.args`:
+
+- If a model already has `meta.n_ctx`, it is left unchanged (the existing value wins over `--ctx-size`).
+- If a model lacks `meta` but has `--ctx-size`, a `meta` object is created with just `n_ctx`.
+- If `--ctx-size` is absent, the model is forwarded untouched.
+- Non-JSON responses, error responses, and responses without a `data` array are forwarded unchanged.
+
+This lets clients that expect an OpenAI-style `meta.n_ctx` on every model get a sensible value even for models that are not currently loaded.
+
+```caddyfile
+example.com {
+    handle /v1/models* {
+        reasoning_effort {
+            models_path /v1/models
+        }
+    }
+}
+```
 
 ## Hooks
 

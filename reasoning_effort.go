@@ -35,6 +35,11 @@ func init() {
 // when no explicit path is configured.
 const defaultPath = "/v1/chat/completions"
 
+// defaultModelsPath is the request path for the llama.cpp model listing.
+// When a response arrives here, meta.n_ctx is synthesized for any model
+// that lacks it, taken from the server's --ctx-size argument.
+const defaultModelsPath = "/v1/models"
+
 // defaultHookTimeout is the per-hook client timeout used when a hook does
 // not specify its own timeout.
 const defaultHookTimeout = 5 * time.Second
@@ -51,6 +56,12 @@ type ReasoningEffort struct {
 	// Path is the request path on which the transformation is applied.
 	// Defaults to "/v1/chat/completions".
 	Path string `json:"path,omitempty"`
+
+	// ModelsPath is the request path for the llama.cpp /v1/models listing.
+	// meta.n_ctx is synthesized for models that lack it, taken from the
+	// server's --ctx-size argument. Defaults to "/v1/models".
+	ModelsPath string `json:"models_path,omitempty"`
+
 	ModelConfig
 	ModelConfigs map[string]ModelConfig `json:"model_configs,omitzero"`
 
@@ -127,6 +138,9 @@ func (m *ReasoningEffort) Provision(ctx caddy.Context) error {
 	if m.Path == "" {
 		m.Path = defaultPath
 	}
+	if m.ModelsPath == "" {
+		m.ModelsPath = defaultModelsPath
+	}
 	m.log = ctx.Logger(m)
 
 	if m.hookClient == nil {
@@ -141,6 +155,11 @@ func (m *ReasoningEffort) Provision(ctx caddy.Context) error {
 			return fmt.Errorf("model_configs[%q] hooks: %w", name, err)
 		}
 	}
+	log := m.log
+	if log == nil {
+		log = zap.NewNop()
+	}
+	log.Debug("config", zap.Any("config", m))
 	return nil
 }
 
@@ -172,9 +191,16 @@ func (m ReasoningEffort) ServeHTTP(w http.ResponseWriter, r *http.Request, next 
 	if log == nil {
 		log = zap.NewNop()
 	}
-
-	// Only transform requests targeting the configured path.
-	if r.URL.Path != m.Path {
+	switch r.URL.Path {
+	case m.ModelsPath:
+		// Synthesize meta.n_ctx for /v1/models responses of models that lack it.
+		log.Debug("matched models path", zap.String("path", r.URL.Path))
+		return m.serveModels(w, r, next)
+	case m.Path:
+		log.Debug("matched chat-completions path", zap.String("path", r.URL.Path))
+	default:
+		log.Debug("not matching any path", zap.String("path", r.URL.Path))
+		// Only transform requests targeting the configured path.
 		return next.ServeHTTP(w, r)
 	}
 
@@ -363,6 +389,11 @@ func (m *ReasoningEffort) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.ArgErr()
 				}
 				m.Path = d.Val()
+			case "models_path":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				m.ModelsPath = d.Val()
 			case "map":
 				if !d.NextArg() {
 					return d.ArgErr()
