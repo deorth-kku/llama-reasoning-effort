@@ -62,6 +62,16 @@ type ReasoningEffort struct {
 	// server's --ctx-size argument. Defaults to "/v1/models".
 	ModelsPath string `json:"models_path,omitempty"`
 
+	// SlotSavePath is the directory llama-server uses for its
+	// --slot-save-path, i.e. where slot save files live. Setting it
+	// enables the slot file LRU (for save/restore tracking and eviction)
+	// and the action=delete handler.
+	SlotSavePath string `json:"slot_save_path,omitempty"`
+
+	// SlotLRUMax is the maximum number of tracked slot save files.
+	// Zero (the default) tracks files without evicting any.
+	SlotLRUMax int `json:"slot_lru_max,omitempty"`
+
 	ModelConfig
 	ModelConfigs map[string]ModelConfig `json:"model_configs,omitzero"`
 
@@ -70,7 +80,12 @@ type ReasoningEffort struct {
 	// gets its own context timeout so different hooks can have different
 	// timeouts without racing on the shared client.
 	hookClient *http.Client
-	log        *zap.Logger
+
+	// slotLRU is the slot save file LRU, created in Provision when
+	// SlotSavePath is set. Nil when the slot features are disabled.
+	slotLRU *slotLRU
+
+	log *zap.Logger
 }
 
 type ModelConfig struct {
@@ -155,9 +170,13 @@ func (m *ReasoningEffort) Provision(ctx caddy.Context) error {
 			return fmt.Errorf("model_configs[%q] hooks: %w", name, err)
 		}
 	}
+
 	log := m.log
 	if log == nil {
 		log = zap.NewNop()
+	}
+	if err := m.provisionSlotLRU(log); err != nil {
+		return err
 	}
 	log.Debug("config", zap.Any("config", m))
 	return nil
@@ -200,6 +219,10 @@ func (m ReasoningEffort) ServeHTTP(w http.ResponseWriter, r *http.Request, next 
 		log.Debug("matched chat-completions path", zap.String("path", r.URL.Path))
 	default:
 		log.Debug("not matching any path", zap.String("path", r.URL.Path))
+		// Try the slot file LRU / delete handler before plain pass-through.
+		if handled, err := m.serveSlots(w, r, next); handled {
+			return err
+		}
 		// Only transform requests targeting the configured path.
 		return next.ServeHTTP(w, r)
 	}
@@ -394,6 +417,10 @@ func (m *ReasoningEffort) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.ArgErr()
 				}
 				m.ModelsPath = d.Val()
+			case "slot_save_path", "slot_lru_max":
+				if err := m.parseSlotOption(d); err != nil {
+					return err
+				}
 			case "map":
 				if !d.NextArg() {
 					return d.ArgErr()

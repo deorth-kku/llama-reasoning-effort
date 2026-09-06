@@ -68,6 +68,8 @@ Or use JSON config:
 | `to_chat_template_key` | string | If set, the `reasoning_effort` value is also written into `chat_template_kwargs` under this key. |
 | `model_configs` | model name → config | Per-model overrides. Each entry supports the same `map`, `to_chat_template_key`, and `hooks` options as the top level. |
 | `hooks` | hook → config | (Top level) An ordered list of hooks fired for every matching request. See [Hooks](#hooks). |
+| `slot_save_path` | string | The directory llama-server uses for its `--slot-save-path`. Setting it enables the slot file LRU and the `action=delete` handler. See [Slot file LRU and delete](#slot-file-lru-and-delete). |
+| `slot_lru_max` | int | Maximum number of tracked slot save files. Zero (default) tracks files without evicting. Requires `slot_save_path`. |
 
 In the Caddyfile, per-model configs use a `model <name> { ... }` block:
 
@@ -206,6 +208,45 @@ example.com {
 ```
 
 In the JSON config, `body_json` is written as a raw JSON value (e.g. `{"event": "request"}`), while `body` is a string template that supports Caddy placeholders.
+
+## Slot file LRU and delete
+
+llama-server can save a slot's prompt cache to a file via `POST /slots/{id_slot}?action=save` and load it back via `action=restore`, but it has no way to delete the saved files. When `slot_save_path` is configured, this plugin intercepts the `/slots/{id_slot}` endpoint and adds both capabilities:
+
+- **LRU tracking and eviction.** Every `save`/`restore` request is forwarded to llama-server immediately (the request body is tee'd to a local copy and the LRU is updated asynchronously from that copy, so the request is never delayed). The `filename` from each request becomes the most recently used entry of an LRU kept in memory and persisted to `.slot-lru.json` inside `slot_save_path`. When the number of tracked files exceeds `slot_lru_max`, the least recently used files are deleted from disk.
+- **`action=delete`.** `POST /slots/{id_slot}?action=delete` with body `{"filename": "..."}` deletes the file directly and updates the LRU. The slot id in the path is ignored — delete targets a file only. The response is `{"filename": "...", "deleted": true|false}`; a missing file is not an error (`deleted: false`).
+
+Notes:
+
+- LRU updates are request-driven: the plugin does not verify the upstream response, so a failed `save` can leave a ghost entry. Ghost entries are cleaned up automatically on the next plugin start, when the LRU state is reconciled against the files actually present on disk.
+- On startup, files present in `slot_save_path` but not yet tracked are adopted into the LRU, ordered by modification time (newest first). Adopted files are placed after all tracked entries, so they are evicted before tracked ones and the oldest adopted file is evicted first.
+- `.slot-lru.json` and the temporary state files (`.slot-lru.json.tmp-*`) are reserved names: the plugin refuses to track or delete them. Saving a slot named `.slot-lru.json` overwrites the LRU state file; the state is rewritten on the next LRU update, or rebuilt from the directory on the next start.
+- `restore` of a file that is not yet tracked adds it to the LRU (and may trigger eviction of the least recently used file).
+- `action=erase` only clears llama-server's in-memory cache and leaves the file on disk, so it is passed through untouched and not tracked.
+- `slot_lru_max` of `0` (the default) tracks files and serves `delete` but never evicts.
+- Filesystem access goes through an internal `SlotFS` interface (local implementation by default), so networked storage such as NFS/SMB can be supported later without changing the LRU logic.
+
+```caddyfile
+example.com {
+    handle /slots/* {
+        reasoning_effort {
+            slot_save_path /var/lib/llama/slots
+            slot_lru_max 16
+        }
+    }
+}
+```
+
+```json
+{
+    "handle": [{
+        "matcher": {"path": ["/slots/*"]},
+        "handler": "reasoning_effort",
+        "slot_save_path": "/var/lib/llama/slots",
+        "slot_lru_max": 16
+    }]
+}
+```
 
 ## License
 
