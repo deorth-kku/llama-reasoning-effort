@@ -68,7 +68,7 @@ Or use JSON config:
 | `to_chat_template_key` | string | If set, the `reasoning_effort` value is also written into `chat_template_kwargs` under this key. |
 | `model_configs` | model name → config | Per-model overrides. Each entry supports the same `map`, `to_chat_template_key`, and `hooks` options as the top level. |
 | `hooks` | hook → config | (Top level) An ordered list of hooks fired for every matching request. See [Hooks](#hooks). |
-| `slot_save_path` | string | The directory llama-server uses for its `--slot-save-path`. Setting it enables the slot file LRU and the `action=delete` handler. See [Slot file LRU and delete](#slot-file-lru-and-delete). |
+| `slot_save_path` | string | Where llama-server's slot save files live: a local directory (llama-server's `--slot-save-path`) or an `smb://` URL pointing at the same directory on an SMB share. Setting it enables the slot file LRU and the `action=delete` handler. See [Slot file LRU and delete](#slot-file-lru-and-delete). |
 | `slot_lru_max` | int | Maximum number of tracked slot save files. Zero (default) tracks files without evicting. Requires `slot_save_path`. |
 
 In the Caddyfile, per-model configs use a `model <name> { ... }` block:
@@ -224,7 +224,7 @@ Notes:
 - `restore` of a file that is not yet tracked adds it to the LRU (and may trigger eviction of the least recently used file).
 - `action=erase` only clears llama-server's in-memory cache and leaves the file on disk, so it is passed through untouched and not tracked.
 - `slot_lru_max` of `0` (the default) tracks files and serves `delete` but never evicts.
-- Filesystem access goes through an internal `SlotFS` interface (local implementation by default), so networked storage such as NFS/SMB can be supported later without changing the LRU logic.
+- Filesystem access goes through an internal `SlotFS` interface with two implementations: the local filesystem (the default) and SMB shares (see below). The LRU logic is identical for both.
 
 ```caddyfile
 example.com {
@@ -243,6 +243,43 @@ example.com {
         "matcher": {"path": ["/slots/*"]},
         "handler": "reasoning_effort",
         "slot_save_path": "/var/lib/llama/slots",
+        "slot_lru_max": 16
+    }]
+}
+```
+
+### SMB shares
+
+`slot_save_path` also accepts an `smb://` URL, in which case the plugin manages the slot files on an SMB share through a pure-Go SMB client (no local mount of the share is required — useful when Caddy runs on a different host than llama-server, which accesses the same directory through its own mount):
+
+```
+smb://[[[domain;]username[:password]@]server[:port]/[share/[path/file]]]
+```
+
+- `server` is the SMB server address; `port` defaults to `445`.
+- The first path segment is the **share name**; the remainder (optional) is the directory within the share, e.g. `smb://user:password@192.168.1.200/share` or `smb://user:password@192.168.1.200:1445/share/llama/slots`.
+- `username` is required (anonymous access is not supported by the SMB client library). `domain` (before the `;`) and `password` are optional. Special characters in credentials must be percent-encoded (e.g. `p%40ss` for `p@ss`).
+- The connection is established at startup; a bad address, share name, or credentials fails Caddy startup. A missing directory inside the share is tolerated (it may be created later by llama-server).
+- Each SMB file operation is bounded by a 30 second timeout, so an unreachable server does not stall requests.
+- Keep the password out of version control: in the Caddyfile use `slot_save_path "smb://user:{env SMB_PASSWORD}@host/share"` (the `{env ...}` placeholder is expanded at startup). Caddy's JSON config does not expand environment variables, so if the JSON file is versioned, generate it from a template (e.g. `envsubst`) or your config management tool. Credentials in the URL are redacted from the debug log.
+
+```caddyfile
+example.com {
+    handle /slots/* {
+        reasoning_effort {
+            slot_save_path smb://user:password@192.168.1.200/share/llama/slots
+            slot_lru_max 16
+        }
+    }
+}
+```
+
+```json
+{
+    "handle": [{
+        "matcher": {"path": ["/slots/*"]},
+        "handler": "reasoning_effort",
+        "slot_save_path": "smb://user:password@192.168.1.200/share/llama/slots",
         "slot_lru_max": 16
     }]
 }

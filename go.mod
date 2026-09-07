@@ -5,6 +5,7 @@ go 1.27
 require (
 	github.com/caddyserver/caddy/v2 v2.11.4
 	github.com/deorth-kku/go-common v0.0.0-20260820000101-85debbe5c1b5
+	github.com/hirochachacha/go-smb2 v1.1.1-0.20260830081004-7245fbcee17a
 	go.uber.org/zap v1.28.0
 )
 
@@ -40,6 +41,7 @@ require (
 	github.com/dgryski/go-farm v0.0.0-20200201041132-a6ae2369ad13 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
+	github.com/geoffgarside/ber v1.1.0 // indirect
 	github.com/go-jose/go-jose/v3 v3.0.5 // indirect
 	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect

@@ -792,3 +792,118 @@ func TestProvisionSlotLRUPathOnly(t *testing.T) {
 		t.Fatal("slotLRU not initialized")
 	}
 }
+
+func TestParseSMBURL(t *testing.T) {
+	tests := []struct {
+		raw     string
+		want    smbURL
+		wantErr bool
+	}{
+		{
+			raw:  "smb://user:password@192.168.1.200/share",
+			want: smbURL{user: "user", password: "password", server: "192.168.1.200:445", share: "share"},
+		},
+		{
+			raw:  "smb://user@192.168.1.200/share/sub/dir",
+			want: smbURL{user: "user", server: "192.168.1.200:445", share: "share", root: "sub/dir"},
+		},
+		{
+			raw:  "smb://user:pass@host/share/",
+			want: smbURL{user: "user", password: "pass", server: "host:445", share: "share"},
+		},
+		{
+			raw:  "smb://domain;user:pass@host:1445/share",
+			want: smbURL{domain: "domain", user: "user", password: "pass", server: "host:1445", share: "share"},
+		},
+		{
+			raw:  "smb://user:p%40ss@host/share",
+			want: smbURL{user: "user", password: "p@ss", server: "host:445", share: "share"},
+		},
+		{
+			raw:  "smb://host/share",
+			want: smbURL{server: "host:445", share: "share"},
+		},
+		{
+			raw:     "smb://user@host",
+			wantErr: true,
+		},
+		{
+			raw:     "smb://user@host/",
+			wantErr: true,
+		},
+		{
+			raw:     "smb://host/",
+			wantErr: true,
+		},
+		{
+			raw:     "http://host/share",
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		got, err := parseSMBURL(tt.raw)
+		if tt.wantErr {
+			if err == nil {
+				t.Errorf("parseSMBURL(%q): expected error, got %+v", tt.raw, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseSMBURL(%q): %v", tt.raw, err)
+			continue
+		}
+		if *got != tt.want {
+			t.Errorf("parseSMBURL(%q) = %+v, want %+v", tt.raw, *got, tt.want)
+		}
+	}
+}
+
+func TestNewSMBFSFromURLRequiresUser(t *testing.T) {
+	if _, err := newSMBFSFromURL("smb://192.168.1.200/share"); err == nil {
+		t.Fatal("expected error for smb URL without username, got nil")
+	}
+}
+
+func TestNewSMBFSFromURLDialFailure(t *testing.T) {
+	// Port 1 on localhost refuses connections immediately.
+	if _, err := newSMBFSFromURL("smb://user:pass@127.0.0.1:1/share"); err == nil {
+		t.Fatal("expected dial error, got nil")
+	}
+}
+
+func TestProvisionSlotLRUSMBInvalidURL(t *testing.T) {
+	m := ReasoningEffort{SlotSavePath: "smb://user@host"}
+	if err := m.provisionSlotLRU(zap.NewNop()); err == nil {
+		t.Fatal("expected error for smb URL without share, got nil")
+	}
+}
+
+func TestProvisionSlotLRUSMBMissingUser(t *testing.T) {
+	m := ReasoningEffort{SlotSavePath: "smb://host/share"}
+	if err := m.provisionSlotLRU(zap.NewNop()); err == nil {
+		t.Fatal("expected error for smb URL without username, got nil")
+	}
+}
+
+func TestRedactSMBURL(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"smb://user:pass@host/share", "smb://***@host/share"},
+		{"smb://domain;user:pass@host:1445/share", "smb://***@host:1445/share"},
+		{"smb://host/share", "smb://host/share"},
+		{"/var/lib/llama/slots", "/var/lib/llama/slots"},
+	}
+	for _, tt := range tests {
+		if got := redactSMBURL(tt.in); got != tt.want {
+			t.Errorf("redactSMBURL(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestSMBFSPathJoining(t *testing.T) {
+	if got := (&smbFS{root: ""}).path("a.bin"); got != "a.bin" {
+		t.Errorf("share root: got %q, want %q", got, "a.bin")
+	}
+	if got := (&smbFS{root: "slots"}).path("a.bin"); got != "slots/a.bin" {
+		t.Errorf("subdirectory: got %q, want %q", got, "slots/a.bin")
+	}
+}

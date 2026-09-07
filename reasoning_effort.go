@@ -22,6 +22,7 @@ import (
 // Interface guards
 var (
 	_ caddy.Provisioner           = (*ReasoningEffort)(nil)
+	_ caddy.CleanerUpper          = (*ReasoningEffort)(nil)
 	_ caddyhttp.MiddlewareHandler = (*ReasoningEffort)(nil)
 	_ caddyfile.Unmarshaler       = (*ReasoningEffort)(nil)
 )
@@ -62,10 +63,13 @@ type ReasoningEffort struct {
 	// server's --ctx-size argument. Defaults to "/v1/models".
 	ModelsPath string `json:"models_path,omitempty"`
 
-	// SlotSavePath is the directory llama-server uses for its
-	// --slot-save-path, i.e. where slot save files live. Setting it
-	// enables the slot file LRU (for save/restore tracking and eviction)
-	// and the action=delete handler.
+	// SlotSavePath is where llama-server's slot save files live. It is
+	// either a local directory (llama-server's --slot-save-path) or an
+	// smb:// URL of the form
+	// smb://[[[domain;]username[:password]@]server[:port]/share[/path]]
+	// pointing at the same directory on an SMB share. Setting it enables
+	// the slot file LRU (for save/restore tracking and eviction) and the
+	// action=delete handler.
 	SlotSavePath string `json:"slot_save_path,omitempty"`
 
 	// SlotLRUMax is the maximum number of tracked slot save files.
@@ -84,6 +88,10 @@ type ReasoningEffort struct {
 	// slotLRU is the slot save file LRU, created in Provision when
 	// SlotSavePath is set. Nil when the slot features are disabled.
 	slotLRU *slotLRU
+
+	// slotSMB is the SMB-backed SlotFS, set in Provision when SlotSavePath
+	// is an smb:// URL. Closed in Cleanup.
+	slotSMB *smbFS
 
 	log *zap.Logger
 }
@@ -178,7 +186,10 @@ func (m *ReasoningEffort) Provision(ctx caddy.Context) error {
 	if err := m.provisionSlotLRU(log); err != nil {
 		return err
 	}
-	log.Debug("config", zap.Any("config", m))
+	// Log a copy with any SMB credentials in SlotSavePath redacted.
+	cfg := *m
+	cfg.SlotSavePath = redactSMBURL(m.SlotSavePath)
+	log.Debug("config", zap.Any("config", cfg))
 	return nil
 }
 

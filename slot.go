@@ -30,22 +30,45 @@ type slotRequestBody struct {
 }
 
 // provisionSlotLRU initializes the slot file LRU from the configured
-// slot options. It returns an error when the options are half-configured
-// (a limit without a save path).
+// slot options. SlotSavePath selects the filesystem: an smb:// URL uses
+// an SMB share (via the pure-Go go-smb2 client), anything else a local
+// directory. It returns an error when the options are half-configured
+// (a limit without a save path) or the SMB URL is unusable.
 func (m *ReasoningEffort) provisionSlotLRU(log *zap.Logger) error {
-	switch {
-	case m.SlotSavePath != "":
-		if m.SlotLRUMax < 0 {
-			return fmt.Errorf("slot_lru_max must be >= 0, got %d", m.SlotLRUMax)
-		}
-		// Do not block startup when the directory is missing: llama-server
-		// may create it later, and the LRU load reports it and reconciles
-		// against disk.
-		m.slotLRU = newSlotLRU(newLocalFS(m.SlotSavePath), m.SlotLRUMax, log)
-	case m.SlotLRUMax != 0:
-		return fmt.Errorf("slot_lru_max is set but slot_save_path is not")
+	if m.SlotLRUMax < 0 {
+		return fmt.Errorf("slot_lru_max must be >= 0, got %d", m.SlotLRUMax)
 	}
+	if m.SlotSavePath == "" {
+		if m.SlotLRUMax != 0 {
+			return fmt.Errorf("slot_lru_max is set but slot_save_path is not")
+		}
+		return nil
+	}
+	if strings.HasPrefix(m.SlotSavePath, "smb://") {
+		fs, err := newSMBFSFromURL(m.SlotSavePath)
+		if err != nil {
+			return fmt.Errorf("slot_save_path: %w", err)
+		}
+		m.slotSMB = fs
+		m.slotLRU = newSlotLRU(fs, m.SlotLRUMax, log)
+		return nil
+	}
+	// Do not block startup when the directory is missing: llama-server
+	// may create it later, and the LRU load reports it and reconciles
+	// against disk.
+	m.slotLRU = newSlotLRU(newLocalFS(m.SlotSavePath), m.SlotLRUMax, log)
 	return nil
+}
+
+// Cleanup implements caddy.CleanerUpper and releases the SMB session when
+// the slot features run against an SMB share.
+func (m *ReasoningEffort) Cleanup() error {
+	if m.slotSMB == nil {
+		return nil
+	}
+	err := m.slotSMB.Close()
+	m.slotSMB = nil
+	return err
 }
 
 // serveSlots handles POST requests to llama-server's /slots/{id_slot}
