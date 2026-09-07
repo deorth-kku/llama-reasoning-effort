@@ -50,7 +50,7 @@ func (m *ReasoningEffort) provisionSlotLRU(log *zap.Logger) error {
 		if err != nil {
 			return fmt.Errorf("slot_save_path: %w", err)
 		}
-		m.slotSMB = fs
+		m.fsCloser = fs
 		m.slotLRU = newSlotLRU(fs, m.SlotLRUMax, log)
 		return nil
 	}
@@ -64,11 +64,11 @@ func (m *ReasoningEffort) provisionSlotLRU(log *zap.Logger) error {
 // Cleanup implements caddy.CleanerUpper and releases the SMB session when
 // the slot features run against an SMB share.
 func (m *ReasoningEffort) Cleanup() error {
-	if m.slotSMB == nil {
+	if m.fsCloser == nil {
 		return nil
 	}
-	err := m.slotSMB.Close()
-	m.slotSMB = nil
+	err := m.fsCloser.Close()
+	m.fsCloser = nil
 	return err
 }
 

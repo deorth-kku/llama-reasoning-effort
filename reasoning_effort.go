@@ -89,9 +89,11 @@ type ReasoningEffort struct {
 	// SlotSavePath is set. Nil when the slot features are disabled.
 	slotLRU *slotLRU
 
-	// slotSMB is the SMB-backed SlotFS, set in Provision when SlotSavePath
-	// is an smb:// URL. Closed in Cleanup.
-	slotSMB *smbFS
+	// fsCloser is the underlying slot filesystem, set in Provision when
+	// SlotSavePath is an smb:// URL. It is an io.Closer rather than a
+	// concrete type so that NFS can be supported in the future; it is
+	// used only to close the filesystem in Cleanup.
+	fsCloser io.Closer
 
 	log *zap.Logger
 }
