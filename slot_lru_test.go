@@ -2,7 +2,10 @@ package reasoningeffort
 
 import (
 	"bytes"
+	"context"
 	"encoding/json/v2"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,6 +19,7 @@ import (
 
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/hirochachacha/go-smb2"
 	"go.uber.org/zap"
 )
 
@@ -52,6 +56,13 @@ func (f *fakeFS) seedAt(name string, data []byte, modtime time.Time) {
 	defer f.mu.Unlock()
 	f.files[name] = data
 	f.modtimes[name] = modtime
+}
+
+// writeCount returns the number of WriteFile calls so far.
+func (f *fakeFS) writeCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.writes
 }
 
 func (f *fakeFS) Remove(name string) error {
@@ -116,10 +127,13 @@ func saveBody(filename string) []byte {
 	return []byte(`{"filename":` + `"` + filename + `"}`)
 }
 
-// lruOrder returns the current LRU order, most recently used first.
+// lruOrder returns the current LRU order, most recently used first. It
+// completes the deferred background load first (if it has not run yet),
+// so it can be called immediately after newSlotLRU.
 func lruOrder(l *slotLRU) []string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.ensureLoaded()
 	out := make([]string, 0, l.list.Len())
 	for el := l.list.Front(); el != nil; el = el.Next() {
 		out = append(out, el.Value.(string))
@@ -314,8 +328,8 @@ func TestSlotLRULoadUnchangedDoesNotRewrite(t *testing.T) {
 	if got := lruOrder(l); !reflect.DeepEqual(got, []string{"a.bin"}) {
 		t.Fatalf("got %v, want [a.bin]", got)
 	}
-	if fs.writes != 0 {
-		t.Fatalf("state file rewritten although nothing changed (writes=%d)", fs.writes)
+	if n := fs.writeCount(); n != 0 {
+		t.Fatalf("state file rewritten although nothing changed (writes=%d)", n)
 	}
 }
 
@@ -859,15 +873,21 @@ func TestParseSMBURL(t *testing.T) {
 }
 
 func TestNewSMBFSFromURLRequiresUser(t *testing.T) {
-	if _, err := newSMBFSFromURL("smb://192.168.1.200/share"); err == nil {
+	if _, err := newSMBFSFromURL("smb://192.168.1.200/share", zap.NewNop()); err == nil {
 		t.Fatal("expected error for smb URL without username, got nil")
 	}
 }
 
 func TestNewSMBFSFromURLDialFailure(t *testing.T) {
-	// Port 1 on localhost refuses connections immediately.
-	if _, err := newSMBFSFromURL("smb://user:pass@127.0.0.1:1/share"); err == nil {
-		t.Fatal("expected dial error, got nil")
+	// Port 1 on localhost refuses connections immediately. The failure is
+	// tolerated: the FS is returned disconnected and reconnects on first
+	// use.
+	fs, err := newSMBFSFromURL("smb://user:pass@127.0.0.1:1/share", zap.NewNop())
+	if err != nil {
+		t.Fatalf("dial failure should be tolerated, got error: %v", err)
+	}
+	if fs.conn.Load() != nil {
+		t.Fatal("expected disconnected FS after dial failure")
 	}
 }
 
@@ -900,10 +920,116 @@ func TestRedactSMBURL(t *testing.T) {
 }
 
 func TestSMBFSPathJoining(t *testing.T) {
-	if got := (&smbFS{root: ""}).path("a.bin"); got != "a.bin" {
+	if got := (&smbFS{cfg: &smbURL{}}).path("a.bin"); got != "a.bin" {
 		t.Errorf("share root: got %q, want %q", got, "a.bin")
 	}
-	if got := (&smbFS{root: "slots"}).path("a.bin"); got != "slots/a.bin" {
+	if got := (&smbFS{cfg: &smbURL{root: "slots"}}).path("a.bin"); got != "slots/a.bin" {
 		t.Errorf("subdirectory: got %q, want %q", got, "slots/a.bin")
+	}
+}
+
+func TestIsConnErr(t *testing.T) {
+	if !isConnErr(&smb2.TransportError{Err: os.ErrClosed}) {
+		t.Error("expected TransportError to be a connection error")
+	}
+	if !isConnErr(&smb2.ContextError{Err: context.DeadlineExceeded}) {
+		t.Error("expected ContextError to be a connection error")
+	}
+	if !isConnErr(fmt.Errorf("wrap: %w", &smb2.TransportError{Err: os.ErrClosed})) {
+		t.Error("expected wrapped TransportError to be a connection error")
+	}
+	if isConnErr(os.ErrNotExist) {
+		t.Error("did not expect ErrNotExist to be a connection error")
+	}
+	if isConnErr(&os.PathError{Op: "open", Path: "x", Err: syscall.ENOENT}) {
+		t.Error("did not expect PathError to be a connection error")
+	}
+	if isConnErr(nil) {
+		t.Error("did not expect nil to be a connection error")
+	}
+}
+
+// flakyFS is an in-memory SlotFS whose reads of the LRU state file fail
+// until a limited number of attempts have been made, simulating an SMB
+// connection that is down at startup and recovers later.
+type flakyFS struct {
+	inner *fakeFS
+	mu    sync.Mutex
+	fails int
+	// onStateRead, if non-nil, is called after every read attempt of the
+	// LRU state file, so tests can synchronize with the background load.
+	onStateRead func()
+}
+
+func (f *flakyFS) Remove(name string) error       { return f.inner.Remove(name) }
+func (f *flakyFS) Stat(name string) (bool, error) { return f.inner.Stat(name) }
+func (f *flakyFS) WriteFile(name string, data []byte) error {
+	return f.inner.WriteFile(name, data)
+}
+func (f *flakyFS) Rename(oldname, newname string) error {
+	return f.inner.Rename(oldname, newname)
+}
+func (f *flakyFS) ListFiles() ([]SlotFileInfo, error) { return f.inner.ListFiles() }
+
+func (f *flakyFS) ReadFile(name string) ([]byte, error) {
+	if name != slotLRUStateFile {
+		return f.inner.ReadFile(name)
+	}
+	f.mu.Lock()
+	failed := f.fails > 0
+	if failed {
+		f.fails--
+	}
+	hook := f.onStateRead
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	if failed {
+		return nil, errors.New("smb connection broken")
+	}
+	return f.inner.ReadFile(name)
+}
+
+func TestSlotLRUDeferredInitRetriesOnFirstUse(t *testing.T) {
+	fs := newFakeFS()
+	fs.seed("a.bin", []byte("x"))
+	state, _ := json.Marshal(slotLRUState{Entries: []string{"a.bin"}})
+	fs.seed(slotLRUStateFile, state)
+	attempted := make(chan struct{})
+	var once sync.Once
+	flaky := &flakyFS{
+		inner:       fs,
+		fails:       1,
+		onStateRead: func() { once.Do(func() { close(attempted) }) },
+	}
+
+	l := newSlotLRU(flaky, 5, zap.NewNop())
+
+	// Wait for the background load to make its (failing) attempt, so the
+	// single failure is consumed by the background load, not the first use.
+	<-attempted
+	l.mu.Lock()
+	uninitialized := l.index == nil
+	l.mu.Unlock()
+	if !uninitialized {
+		t.Fatal("expected uninitialized table after failed background load")
+	}
+
+	// The first use retries the load and picks up the persisted state.
+	l.record(saveBody("b.bin"))
+	if got := lruOrder(l); !reflect.DeepEqual(got, []string{"b.bin", "a.bin"}) {
+		t.Fatalf("order = %v, want [b.bin a.bin]", got)
+	}
+}
+
+func TestSlotLRUStartsEmptyWhenLoadKeepsFailing(t *testing.T) {
+	fs := newFakeFS()
+	flaky := &flakyFS{inner: fs, fails: 1 << 30}
+
+	l := newSlotLRU(flaky, 5, zap.NewNop())
+	l.record(saveBody("a.bin"))
+	if got := lruOrder(l); !reflect.DeepEqual(got, []string{"a.bin"}) {
+		t.Fatalf("order = %v, want [a.bin]", got)
 	}
 }

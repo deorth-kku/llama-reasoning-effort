@@ -2,23 +2,35 @@ package reasoningeffort
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/hirochachacha/go-smb2"
+	"go.uber.org/zap"
 )
 
 // defaultSMBPort is the default SMB server port, used when the URL has no
 // port.
 const defaultSMBPort = "445"
 
-// smbDialTimeout bounds the TCP dial when connecting to the SMB server in
-// Provision.
-const smbDialTimeout = 10 * time.Second
+// smbConnTimeout bounds the entire SMB connection setup (TCP dial,
+// session negotiation, share mount) so a stalled server cannot hang
+// startup or a file operation.
+const smbConnTimeout = 15 * time.Second
+
+// smbCloseTimeout bounds the disconnect requests (Umount, Logoff) sent
+// when tearing down a connection. The go-smb2 client runs them on the
+// share's and session's own contexts, which are background; a
+// half-open connection (the peer stopped responding without closing the
+// TCP connection) would otherwise block them indefinitely, hanging
+// Caddy shutdown or a reconnect.
+const smbCloseTimeout = 5 * time.Second
 
 // smbOpTimeout bounds each SMB file operation. Slot files and the LRU
 // state file are small, so an unreachable or hung server must not stall
@@ -98,23 +110,40 @@ func redactSMBURL(raw string) string {
 	return raw
 }
 
+// smbConn pairs an SMB session with the share mounted on it. The pair is
+// swapped in as a single atomic unit when (re)connecting, so readers never
+// observe a session and a share from different connections.
+type smbConn struct {
+	session *smb2.Session
+	share   *smb2.Share
+}
+
 // smbFS is the SlotFS implementation backed by an SMB share, accessed
 // through the pure-Go go-smb2 client. It lets Caddy manage slot files on a
 // share it does not (and need not) mount locally, e.g. when Caddy runs on
 // a different host than llama-server.
+//
+// The live connection is held in an atomic pointer and (re)established on
+// demand: an operation that fails because the connection is broken
+// reconnects once and retries. No locks are used; the atomic pointer is
+// the only synchronization.
 type smbFS struct {
-	session *smb2.Session
-	share   *smb2.Share
-	root    string // directory within the share; "" = share root
+	cfg  *smbURL
+	conn atomic.Pointer[smbConn]
 }
 
-// newSMBFSFromURL dials the SMB server from the given smb:// URL, mounts
-// the share, and returns a SlotFS rooted at the URL's path within the
-// share. Connection failures (bad address, credentials, or share name)
-// are returned as errors. A missing root directory is tolerated,
-// mirroring the local implementation: the directory may be created later
-// (e.g. by llama-server on the host that mounts the share).
-func newSMBFSFromURL(raw string) (*smbFS, error) {
+// newSMBFSFromURL parses the smb:// URL and attempts to connect, bounded
+// in total by smbConnTimeout. A failed connection is not an error: the
+// returned SlotFS is left disconnected and reconnects on first use, so a
+// down SMB server does not block Caddy startup. Malformed URLs and missing
+// credentials are configuration errors and are returned immediately. A
+// missing root directory is tolerated, mirroring the local implementation:
+// the directory may be created later (e.g. by llama-server on the host that
+// mounts the share).
+func newSMBFSFromURL(raw string, log *zap.Logger) (*smbFS, error) {
+	if log == nil {
+		log = zap.NewNop()
+	}
 	cfg, err := parseSMBURL(raw)
 	if err != nil {
 		return nil, err
@@ -122,113 +151,219 @@ func newSMBFSFromURL(raw string) (*smbFS, error) {
 	if cfg.user == "" {
 		return nil, fmt.Errorf("smb URL %q: username is required (go-smb2 does not support anonymous access)", redactSMBURL(raw))
 	}
-	conn, err := net.DialTimeout("tcp", cfg.server, smbDialTimeout)
+	f := &smbFS{cfg: cfg}
+	if err := f.connect(); err != nil {
+		// Leave the FS disconnected; the first operation reconnects.
+		log.Warn("slot SMB: initial connection failed, will retry on first use",
+			zap.String("server", cfg.server), zap.Error(err))
+	}
+	return f, nil
+}
+
+// connect dials the SMB server, negotiates a session, and mounts the
+// share, bounded in total by smbConnTimeout. The new connection is swapped
+// in atomically; the previous one (if any) is disconnected.
+func (f *smbFS) connect() error {
+	ctx, cancel := context.WithTimeout(context.Background(), smbConnTimeout)
+	defer cancel()
+	conn, err := net.DialTimeout("tcp", f.cfg.server, smbConnTimeout)
 	if err != nil {
-		return nil, fmt.Errorf("dial %s: %w", cfg.server, err)
+		return fmt.Errorf("dial %s: %w", f.cfg.server, err)
 	}
 	dialer := &smb2.Dialer{
 		Initiator: &smb2.NTLMInitiator{
-			User:     cfg.user,
-			Password: cfg.password,
-			Domain:   cfg.domain,
+			User:     f.cfg.user,
+			Password: f.cfg.password,
+			Domain:   f.cfg.domain,
 		},
 	}
-	session, err := dialer.Dial(conn)
+	session, err := dialer.DialContext(ctx, conn)
 	if err != nil {
 		_ = conn.Close()
-		return nil, fmt.Errorf("session setup with %s: %w", cfg.server, err)
+		return fmt.Errorf("session setup with %s: %w", f.cfg.server, err)
 	}
-	share, err := session.Mount(cfg.share)
+	// Mount uses the session's context, which is background; bind the
+	// setup timeout to it explicitly.
+	share, err := session.WithContext(ctx).Mount(f.cfg.share)
 	if err != nil {
 		_ = session.Logoff()
-		return nil, fmt.Errorf("mount share %q: %w", cfg.share, err)
+		return fmt.Errorf("mount share %q: %w", f.cfg.share, err)
 	}
-	return &smbFS{session: session, share: share, root: cfg.root}, nil
+	old := f.conn.Swap(&smbConn{session: session, share: share})
+	if old != nil {
+		old.close()
+	}
+	return nil
+}
+
+// close disconnects the share and the session, releasing the TCP
+// connection. The disconnect requests are bounded in total by
+// smbCloseTimeout (see its comment).
+func (c *smbConn) close() {
+	ctx, cancel := context.WithTimeout(context.Background(), smbCloseTimeout)
+	defer cancel()
+	_ = c.share.WithContext(ctx).Umount()
+	_ = c.session.WithContext(ctx).Logoff()
+}
+
+// isConnErr reports whether err indicates a broken SMB connection rather
+// than a protocol- or file-level error, i.e. a failure worth reconnecting
+// and retrying the operation once. go-smb2 surfaces TCP failures as
+// *smb2.TransportError and expired operation deadlines as
+// *smb2.ContextError.
+func isConnErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var te *smb2.TransportError
+	if errors.As(err, &te) {
+		return true
+	}
+	var ce *smb2.ContextError
+	if errors.As(err, &ce) {
+		return true
+	}
+	return false
+}
+
+// withShare runs op against the current share, reconnecting once and
+// retrying if the operation fails because the connection is broken. If no
+// connection is established yet, it connects first. op receives a share
+// bound to a context that expires after smbOpTimeout, bounding a single
+// SMB operation.
+func (f *smbFS) withShare(op func(s *smb2.Share) error) error {
+	c := f.conn.Load()
+	if c == nil {
+		if err := f.connect(); err != nil {
+			return err
+		}
+		if c = f.conn.Load(); c == nil {
+			// Closed between the connect and the load.
+			return fmt.Errorf("smb connection closed")
+		}
+	}
+	for attempt := 0; ; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), smbOpTimeout)
+		err := op(c.share.WithContext(ctx))
+		cancel()
+		if err == nil || attempt > 0 || !isConnErr(err) {
+			return err
+		}
+		// The connection is broken.
+		cur := f.conn.Load()
+		if cur == nil {
+			// The FS was closed; do not reconnect.
+			return err
+		}
+		if cur != c {
+			// Another goroutine already reconnected; reuse its connection.
+			c = cur
+			continue
+		}
+		if rerr := f.connect(); rerr != nil {
+			return fmt.Errorf("smb reconnect: %w", rerr)
+		}
+		if c = f.conn.Load(); c == nil {
+			return fmt.Errorf("smb connection closed")
+		}
+	}
 }
 
 // path joins the share-root directory with the file name. go-smb2
 // normalizes "/" separators, so plain forward slashes are fine.
 func (f *smbFS) path(name string) string {
-	if f.root == "" {
+	if f.cfg.root == "" {
 		return name
 	}
-	return f.root + "/" + name
-}
-
-// op returns the share bound to a context that expires after
-// smbOpTimeout, bounding a single SMB operation. The caller must invoke
-// the returned cancel function (typically via defer) once the operation
-// completes.
-func (f *smbFS) op() (*smb2.Share, context.CancelFunc) {
-	ctx, cancel := context.WithTimeout(context.Background(), smbOpTimeout)
-	return f.share.WithContext(ctx), cancel
+	return f.cfg.root + "/" + name
 }
 
 func (f *smbFS) Remove(name string) error {
-	s, cancel := f.op()
-	defer cancel()
-	return s.Remove(f.path(name))
+	return f.withShare(func(s *smb2.Share) error {
+		return s.Remove(f.path(name))
+	})
 }
 
 func (f *smbFS) Stat(name string) (bool, error) {
-	s, cancel := f.op()
-	defer cancel()
-	_, err := s.Stat(f.path(name))
-	if err == nil {
-		return true, nil
-	}
-	if os.IsNotExist(err) {
-		return false, nil
-	}
-	return false, err
+	exists := false
+	err := f.withShare(func(s *smb2.Share) error {
+		_, e := s.Stat(f.path(name))
+		if e == nil {
+			exists = true
+			return nil
+		}
+		if os.IsNotExist(e) {
+			return nil
+		}
+		return e
+	})
+	return exists, err
 }
 
 func (f *smbFS) ReadFile(name string) ([]byte, error) {
-	s, cancel := f.op()
-	defer cancel()
-	return s.ReadFile(f.path(name))
+	var data []byte
+	if err := f.withShare(func(s *smb2.Share) error {
+		var e error
+		data, e = s.ReadFile(f.path(name))
+		return e
+	}); err != nil {
+		return nil, err
+	}
+	return data, nil
 }
 
 func (f *smbFS) WriteFile(name string, data []byte) error {
-	s, cancel := f.op()
-	defer cancel()
-	return s.WriteFile(f.path(name), data, 0o666)
+	return f.withShare(func(s *smb2.Share) error {
+		return s.WriteFile(f.path(name), data, 0o666)
+	})
 }
 
 func (f *smbFS) Rename(oldname, newname string) error {
 	// Server-side rename (ReplaceIfExists); atomicity on the share is
 	// best-effort.
-	s, cancel := f.op()
-	defer cancel()
-	return s.Rename(f.path(oldname), f.path(newname))
+	return f.withShare(func(s *smb2.Share) error {
+		return s.Rename(f.path(oldname), f.path(newname))
+	})
 }
 
 func (f *smbFS) ListFiles() ([]SlotFileInfo, error) {
-	dir := f.root
+	dir := f.cfg.root
 	if dir == "" {
 		dir = "."
 	}
-	s, cancel := f.op()
-	defer cancel()
-	infos, err := s.ReadDir(dir)
-	if err != nil {
-		return nil, err
-	}
-	files := make([]SlotFileInfo, 0, len(infos))
-	for _, info := range infos {
-		if info.IsDir() {
-			continue
+	var files []SlotFileInfo
+	if err := f.withShare(func(s *smb2.Share) error {
+		infos, e := s.ReadDir(dir)
+		if e != nil {
+			return e
 		}
-		files = append(files, SlotFileInfo{Name: info.Name(), ModTime: info.ModTime()})
+		files = make([]SlotFileInfo, 0, len(infos))
+		for _, info := range infos {
+			if info.IsDir() {
+				continue
+			}
+			files = append(files, SlotFileInfo{Name: info.Name(), ModTime: info.ModTime()})
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 	return files, nil
 }
 
-// Close disconnects the share and the session, releasing the TCP
-// connection. It is called from the module's Cleanup.
+// Close disconnects the current share and session, releasing the TCP
+// connection. It is called from the module's Cleanup. Swapping the
+// connection pointer to nil prevents a concurrent operation from
+// resurrecting the connection after shutdown.
 func (f *smbFS) Close() error {
-	err := f.share.Umount()
-	if lerr := f.session.Logoff(); err == nil {
+	c := f.conn.Swap(nil)
+	if c == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), smbCloseTimeout)
+	defer cancel()
+	err := c.share.WithContext(ctx).Umount()
+	if lerr := c.session.WithContext(ctx).Logoff(); err == nil {
 		err = lerr
 	}
 	return err

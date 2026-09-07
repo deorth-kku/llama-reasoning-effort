@@ -33,7 +33,8 @@ type slotRequestBody struct {
 // slot options. SlotSavePath selects the filesystem: an smb:// URL uses
 // an SMB share (via the pure-Go go-smb2 client), anything else a local
 // directory. It returns an error when the options are half-configured
-// (a limit without a save path) or the SMB URL is unusable.
+// (a limit without a save path) or the SMB URL is malformed. A failed SMB
+// connection is not an error: the share is reached on first use instead.
 func (m *ReasoningEffort) provisionSlotLRU(log *zap.Logger) error {
 	if m.SlotLRUMax < 0 {
 		return fmt.Errorf("slot_lru_max must be >= 0, got %d", m.SlotLRUMax)
@@ -45,7 +46,7 @@ func (m *ReasoningEffort) provisionSlotLRU(log *zap.Logger) error {
 		return nil
 	}
 	if strings.HasPrefix(m.SlotSavePath, "smb://") {
-		fs, err := newSMBFSFromURL(m.SlotSavePath)
+		fs, err := newSMBFSFromURL(m.SlotSavePath, log)
 		if err != nil {
 			return fmt.Errorf("slot_save_path: %w", err)
 		}

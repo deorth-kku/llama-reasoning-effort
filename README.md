@@ -259,7 +259,9 @@ smb://[[[domain;]username[:password]@]server[:port]/[share/[path/file]]]
 - `server` is the SMB server address; `port` defaults to `445`.
 - The first path segment is the **share name**; the remainder (optional) is the directory within the share, e.g. `smb://user:password@192.168.1.200/share` or `smb://user:password@192.168.1.200:1445/share/llama/slots`.
 - `username` is required (anonymous access is not supported by the SMB client library). `domain` (before the `;`) and `password` are optional. Special characters in credentials must be percent-encoded (e.g. `p%40ss` for `p@ss`).
-- The connection is established at startup; a bad address, share name, or credentials fails Caddy startup. A missing directory inside the share is tolerated (it may be created later by llama-server).
+- The connection is attempted at startup, bounded by a 15 second timeout. If the server is unreachable (or the share name or credentials are bad), startup is not blocked: the LRU state is loaded in the background after startup (and retried on the first slot save/restore if that load fails), which retrieves the connection.
+- A file operation that fails because the connection broke reconnects once and retries the operation.
+- A missing directory inside the share is tolerated (it may be created later by llama-server).
 - Each SMB file operation is bounded by a 30 second timeout, so an unreachable server does not stall requests.
 - Keep the password out of version control: in the Caddyfile use `slot_save_path "smb://user:{env SMB_PASSWORD}@host/share"` (the `{env ...}` placeholder is expanded at startup). Caddy's JSON config does not expand environment variables, so if the JSON file is versioned, generate it from a template (e.g. `envsubst`) or your config management tool. Credentials in the URL are redacted from the debug log.
 
