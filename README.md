@@ -124,6 +124,24 @@ example.com {
 }
 ```
 
+## /v1/models reasoning.supported_effort injection
+
+OpenRouter-style clients read a `reasoning` block (with `supported_effort`) from each model entry to learn which `reasoning_effort` values a model accepts. llama-server's listing carries no such block, so the plugin synthesizes it from its own mapping config:
+
+- For each model entry, the config selected by the entry's `id` is used: a matching key in `model_configs` wins over the top-level config (the same selection rule as the request transformation).
+- `reasoning.supported_effort` is set to the **sorted union** of that config's `map` and `logit_bias` keys.
+- If a model already carries `reasoning.supported_effort`, it is left unchanged (the existing value wins over the synthesized one).
+- If neither `map` nor `logit_bias` is configured for the model, no `reasoning` block is added.
+
+```json
+{
+    "id": "llama-4",
+    "reasoning": {
+        "supported_effort": ["high", "low", "medium"]
+    }
+}
+```
+
 ## Hooks
 
 In addition to rewriting the body, the plugin can fire one or more outbound HTTP **hooks** for every request that matches the configured `path`. Hooks are useful for logging, metrics, tracing, or notifying external systems when a request arrives.

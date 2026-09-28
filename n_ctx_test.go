@@ -1,10 +1,12 @@
 package reasoningeffort
 
 import (
+	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
@@ -269,6 +271,164 @@ func TestCtxSizeFromArgs(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := ctxSizeFromArgs(tc.args); got != tc.want {
 				t.Errorf("ctxSizeFromArgs(%v) = %d, want %d", tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
+// stringSliceEqual reports whether got equals want element-wise.
+func stringSliceEqual(got []any, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range want {
+		if s, ok := got[i].(string); !ok || s != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestServeModelsInjectsSupportedEffort verifies reasoning.supported_effort
+// is synthesized from the config's Map/LogitBias keys: the top-level config
+// applies to models without a per-model config, a matching per-model config
+// wins, the keys are the sorted union of map and logit_bias, and pass-through
+// fields survive the re-serialization.
+func TestServeModelsInjectsSupportedEffort(t *testing.T) {
+	body := `{
+  "object": "model.list",
+  "data": [
+    {"id":"test-model-a","object":"model","owned_by":"llamacpp","created":1700000000,"status":{"value":"unloaded","args":["--model","/m/a.gguf"]}},
+    {"id":"test-model-b","object":"model","owned_by":"llamacpp","created":1700000000,"status":{"value":"loaded","args":[]}}
+  ]
+}`
+	m := ReasoningEffort{
+		Map: newTestMap(),
+		ModelConfigs: map[string]ModelConfig{
+			"test-model-b": {
+				Map: map[string]int64{
+					"medium": 2048,
+					"low":    512,
+				},
+				LogitBias: map[string]jsontext.Value{
+					"high": []byte(`{"50256":false}`),
+				},
+			},
+		},
+	}
+	rec := runModelsResponse(t, m, defaultModelsPath, body, "application/json")
+
+	var resp struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("patched body not valid json: %v\n%s", err, rec.Body.String())
+	}
+	if len(resp.Data) != 2 {
+		t.Fatalf("expected 2 models, got %d", len(resp.Data))
+	}
+
+	getEfforts := func(id string) ([]any, bool) {
+		for _, e := range resp.Data {
+			if e["id"] != id {
+				continue
+			}
+			r, ok := e["reasoning"].(map[string]any)
+			if !ok {
+				return nil, false
+			}
+			v, ok := r["supported_effort"].([]any)
+			return v, ok
+		}
+		return nil, false
+	}
+
+	// test-model-a has no per-model config: the top-level map keys apply,
+	// sorted.
+	if got, ok := getEfforts("test-model-a"); !ok || !stringSliceEqual(got, []string{"high", "low", "max", "medium", "minimal", "xhigh"}) {
+		t.Errorf("expected test-model-a supported_effort=[high low max medium minimal xhigh], got %v (present=%v)", got, ok)
+	}
+	// test-model-b uses its per-model config: the union of its map and
+	// logit_bias keys, sorted.
+	if got, ok := getEfforts("test-model-b"); !ok || !stringSliceEqual(got, []string{"high", "low", "medium"}) {
+		t.Errorf("expected test-model-b supported_effort=[high low medium], got %v (present=%v)", got, ok)
+	}
+
+	// Pass-through fields must survive the re-serialization.
+	for _, e := range resp.Data {
+		if e["owned_by"] != "llamacpp" {
+			t.Errorf("expected owned_by=llamacpp preserved for %v, got %v", e["id"], e["owned_by"])
+		}
+	}
+}
+
+// TestServeModelsKeepsExistingSupportedEffort verifies an existing
+// reasoning.supported_effort is not overwritten by the synthesized one, and
+// sibling fields of the reasoning block are preserved.
+func TestServeModelsKeepsExistingSupportedEffort(t *testing.T) {
+	body := `{"object":"model.list","data":[{"id":"test-model","object":"model","status":{"value":"loaded","args":[]},"reasoning":{"supported_effort":["low"],"extra_field":1}}]}`
+	rec := runModelsResponse(t, ReasoningEffort{Map: newTestMap()}, defaultModelsPath, body, "application/json")
+
+	var resp struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("body not valid json: %v", err)
+	}
+	if len(resp.Data) != 1 {
+		t.Fatalf("expected 1 model, got %d", len(resp.Data))
+	}
+	r, ok := resp.Data[0]["reasoning"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected reasoning present, got %v", resp.Data[0]["reasoning"])
+	}
+	if eff, ok := r["supported_effort"].([]any); !ok || !stringSliceEqual(eff, []string{"low"}) {
+		t.Errorf("expected existing supported_effort=[low] preserved, got %v", r["supported_effort"])
+	}
+	if r["extra_field"] != float64(1) {
+		t.Errorf("expected reasoning.extra_field=1 preserved, got %v", r["extra_field"])
+	}
+}
+
+// TestServeModelsNoEffortConfigUnchanged verifies no reasoning block is
+// added when neither map nor logit_bias is configured.
+func TestServeModelsNoEffortConfigUnchanged(t *testing.T) {
+	body := `{"object":"model.list","data":[{"id":"test-model","object":"model","status":{"value":"unloaded","args":[]}}]}`
+	rec := runModelsResponse(t, ReasoningEffort{}, defaultModelsPath, body, "application/json")
+
+	var resp struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("body not valid json: %v", err)
+	}
+	if len(resp.Data) != 1 {
+		t.Fatalf("expected 1 model, got %d", len(resp.Data))
+	}
+	if _, ok := resp.Data[0]["reasoning"]; ok {
+		t.Errorf("expected no reasoning block when no map/logit_bias is configured, got %v", resp.Data[0]["reasoning"])
+	}
+}
+
+// TestSupportedEfforts verifies the sorted union of Map and LogitBias keys.
+func TestSupportedEfforts(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  ModelConfig
+		want []string
+	}{
+		{"empty", ModelConfig{}, nil},
+		{"map only", ModelConfig{Map: map[string]int64{"high": 1, "low": 2}}, []string{"high", "low"}},
+		{"logit_bias only", ModelConfig{LogitBias: map[string]jsontext.Value{"medium": nil}}, []string{"medium"}},
+		{"union deduped", ModelConfig{
+			Map:       map[string]int64{"high": 1, "low": 2},
+			LogitBias: map[string]jsontext.Value{"high": nil, "max": nil},
+		}, []string{"high", "low", "max"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := supportedEfforts(tc.cfg); !slices.Equal(got, tc.want) {
+				t.Errorf("supportedEfforts() = %v, want %v", got, tc.want)
 			}
 		})
 	}

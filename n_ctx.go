@@ -5,6 +5,7 @@ import (
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -24,10 +25,11 @@ type modelsResponse struct {
 
 // modelEntry mirrors one element of the /v1/models `data` array.
 type modelEntry struct {
-	ID     string         `json:"id,omitzero"`
-	Status modelStatus    `json:"status,omitzero"`
-	Meta   *modelMeta     `json:"meta,omitzero"`
-	Inline jsontext.Value `json:",embed"`
+	ID        string          `json:"id,omitzero"`
+	Status    modelStatus     `json:"status,omitzero"`
+	Meta      *modelMeta      `json:"meta,omitzero"`
+	Reasoning *modelReasoning `json:"reasoning,omitzero"`
+	Inline    jsontext.Value  `json:",embed"`
 }
 
 // modelStatus carries the load status plus the raw server arguments. The
@@ -43,6 +45,16 @@ type modelStatus struct {
 type modelMeta struct {
 	NCtx   cjson.Nullable[int64] `json:"n_ctx,omitzero"`
 	Inline jsontext.Value        `json:",embed"`
+}
+
+// modelReasoning captures the reasoning capabilities block (an
+// OpenRouter-style field that llama-server does not provide).
+// SupportedEffort lists the reasoning_effort values the model accepts; it
+// is synthesized from the configured Map/LogitBias keys when upstream
+// omits it.
+type modelReasoning struct {
+	SupportedEffort []string       `json:"supported_effort,omitzero"`
+	Inline          jsontext.Value `json:",embed"`
 }
 
 // bufferedResponseWriter wraps an http.ResponseWriter and buffers the body
@@ -103,8 +115,10 @@ func (b *bufferedResponseWriter) flush() error {
 }
 
 // serveModels handles the /v1/models listing. It buffers the upstream
-// response and, for every model that lacks meta.n_ctx, injects it from the
-// --ctx-size argument in status.args. Non-JSON responses, error responses,
+// response and enriches every model entry: meta.n_ctx is injected from the
+// --ctx-size argument in status.args when missing, and
+// reasoning.supported_effort is filled from the Map/LogitBias keys of the
+// config selected by the entry's id. Non-JSON responses, error responses,
 // and responses without a data array are forwarded unchanged.
 func (m ReasoningEffort) serveModels(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	log := m.log
@@ -131,9 +145,12 @@ func (m ReasoningEffort) serveModels(w http.ResponseWriter, r *http.Request, nex
 		return bw.flush()
 	}
 
-	added := patchModels(&resp)
-	if added > 0 {
-		log.Info("injected meta.n_ctx into /v1/models response", zap.Int("models", added))
+	nctx, reasoning := patchModels(&resp, m.ModelConfig, m.ModelConfigs)
+	if nctx > 0 {
+		log.Info("injected meta.n_ctx into /v1/models response", zap.Int("models", nctx))
+	}
+	if reasoning > 0 {
+		log.Info("injected reasoning.supported_effort into /v1/models response", zap.Int("models", reasoning))
 	}
 
 	// Re-serialize the patched response and replace the buffered body.
@@ -148,32 +165,60 @@ func (m ReasoningEffort) serveModels(w http.ResponseWriter, r *http.Request, nex
 	return bw.flush()
 }
 
-// patchModels injects meta.n_ctx into every model entry that lacks it,
-// reading the context size from the entry's status.args. It returns the
-// number of entries patched.
-func patchModels(resp *modelsResponse) int {
-	added := 0
+// patchModels enriches every model entry that is missing fields.
+// meta.n_ctx is read from the entry's status.args; reasoning.supported_effort
+// is the union of the Map and LogitBias keys of the config selected by the
+// entry's id (a matching per-model config wins over the top-level one).
+// Existing values always win over synthesized ones. It returns the number
+// of entries that gained n_ctx and reasoning respectively.
+func patchModels(resp *modelsResponse, def ModelConfig, perModel map[string]ModelConfig) (nctx, reasoning int) {
 	for i := range resp.Data {
 		e := &resp.Data[i]
 
-		ctxSize := ctxSizeFromArgs(e.Status.Args)
-		if ctxSize <= 0 {
-			// No --ctx-size to derive from; leave the entry untouched.
-			continue
-		}
-		if e.Meta != nil && e.Meta.NCtx.Valid {
-			// Already carries a context size.
-			continue
+		// meta.n_ctx from the --ctx-size argument.
+		if ctxSize := ctxSizeFromArgs(e.Status.Args); ctxSize > 0 && (e.Meta == nil || !e.Meta.NCtx.Valid) {
+			if e.Meta == nil {
+				e.Meta = &modelMeta{}
+			}
+			e.Meta.NCtx = cjson.NewNullable(ctxSize)
+			nctx++
 		}
 
-		if e.Meta == nil {
-			e.Meta = &modelMeta{
-				NCtx: cjson.NewNullable(ctxSize),
-			}
+		// reasoning.supported_effort from the config's Map/LogitBias keys.
+		cfg := def
+		if mc, ok := perModel[e.ID]; ok {
+			cfg = mc
 		}
-		added++
+		if efforts := supportedEfforts(cfg); efforts != nil && (e.Reasoning == nil || e.Reasoning.SupportedEffort == nil) {
+			if e.Reasoning == nil {
+				e.Reasoning = &modelReasoning{}
+			}
+			e.Reasoning.SupportedEffort = efforts
+			reasoning++
+		}
 	}
-	return added
+	return nctx, reasoning
+}
+
+// supportedEfforts returns the sorted union of the config's Map and
+// LogitBias keys, or nil when neither map is configured.
+func supportedEfforts(cfg ModelConfig) []string {
+	if len(cfg.Map) == 0 && len(cfg.LogitBias) == 0 {
+		return nil
+	}
+	set := make(map[string]struct{}, len(cfg.Map)+len(cfg.LogitBias))
+	for k := range cfg.Map {
+		set[k] = struct{}{}
+	}
+	for k := range cfg.LogitBias {
+		set[k] = struct{}{}
+	}
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	slices.Sort(out)
+	return out
 }
 
 // ctxSizeFromArgs scans a flat --flag/argument slice for --ctx-size and
