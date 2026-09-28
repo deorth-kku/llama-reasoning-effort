@@ -102,8 +102,10 @@ type ModelConfig struct {
 	// Map maps a reasoning_effort value (e.g. "medium") to the
 	// corresponding thinking_budget_tokens value. There is no built-in
 	// default mapping; values absent from the map are left unchanged.
-	Map               map[string]int64 `json:"map,omitzero"`
-	ToChatTemplateKey string           `json:"to_chat_template_key,omitzero"`
+	Map               map[string]int64          `json:"map,omitzero"`
+	LogitBias         map[string]jsontext.Value `json:"logit_bias,omitzero"`
+	ToChatTemplateKey string                    `json:"to_chat_template_key,omitzero"`
+	Remove            bool                      `json:"remove,omitzero"`
 
 	// Hooks is the ordered list of hooks fired for requests targeting the
 	// model this config applies to. When a request's model matches a
@@ -141,6 +143,7 @@ type RequestBody struct {
 	Model              string         `json:"model,omitzero"`
 	ReasoningEffort    string         `json:"reasoning_effort,omitzero"`
 	ChatTemplateKwargs kwargs         `json:"chat_template_kwargs,omitzero"`
+	LogitBias          jsontext.Value `json:"logit_bias,omitzero"`
 	ThinkingBudget     int64          `json:"thinking_budget_tokens,omitzero"`
 	Inline             jsontext.Value `json:",embed"`
 }
@@ -285,11 +288,25 @@ func (m ReasoningEffort) ServeHTTP(w http.ResponseWriter, r *http.Request, next 
 			log.Info("skipping transformation: unknown reasoning_effort value", zap.String("value", level))
 		}
 
+		// Look up logit_bias (only when the level is present in the map).
+		if logitBias := useconfig.LogitBias[level]; logitBias != nil {
+			log.Debug("mapped logit_bias", zap.String("reasoning_effort", level), zap.String("logit_bias", string(logitBias)))
+			body.LogitBias = logitBias
+		} else if len(useconfig.LogitBias) > 0 {
+			// Only log when a logit_bias map is configured; otherwise the
+			// value is simply not mapped and there is nothing to report.
+			log.Info("skipping logit_bias: unknown reasoning_effort value", zap.String("value", level))
+		}
+
 		if useconfig.ToChatTemplateKey != "" {
 			if body.ChatTemplateKwargs.Inline == nil {
 				body.ChatTemplateKwargs.Inline = make(map[string]any)
 			}
 			body.ChatTemplateKwargs.Inline[useconfig.ToChatTemplateKey] = level
+		}
+
+		if useconfig.Remove {
+			body.ReasoningEffort = ""
 		}
 	}
 
@@ -452,6 +469,21 @@ func (m *ReasoningEffort) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.ArgErr()
 				}
 				m.ToChatTemplateKey = d.Val()
+			case "logit_bias":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				level := d.Val()
+				bias, err := parseLogitBiasBlock(d)
+				if err != nil {
+					return err
+				}
+				if m.LogitBias == nil {
+					m.LogitBias = map[string]jsontext.Value{}
+				}
+				m.LogitBias[level] = bias
+			case "remove":
+				m.Remove = true
 			case "model":
 				if !d.NextArg() {
 					return d.ArgErr()
@@ -481,8 +513,9 @@ func (m *ReasoningEffort) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 
 // parseModelConfigBlock parses a `model <name> { ... }` block into a
 // ModelConfig. The dispenser must be positioned at the model name token,
-// with the block opening brace on the same line. Only `map` and
-// `to_chat_template_key` are allowed inside a model block.
+// with the block opening brace on the same line. Only `map`,
+// `to_chat_template_key`, `logit_bias`, `remove`, and `hook` are allowed
+// inside a model block.
 func parseModelConfigBlock(d *caddyfile.Dispenser) (ModelConfig, error) {
 	var mc ModelConfig
 	// The dispenser is positioned on the model name token, with the
@@ -516,6 +549,21 @@ func parseModelConfigBlock(d *caddyfile.Dispenser) (ModelConfig, error) {
 				return mc, d.ArgErr()
 			}
 			mc.ToChatTemplateKey = d.Val()
+		case "logit_bias":
+			if !d.NextArg() {
+				return mc, d.ArgErr()
+			}
+			level := d.Val()
+			bias, err := parseLogitBiasBlock(d)
+			if err != nil {
+				return mc, err
+			}
+			if mc.LogitBias == nil {
+				mc.LogitBias = map[string]jsontext.Value{}
+			}
+			mc.LogitBias[level] = bias
+		case "remove":
+			mc.Remove = true
 		case "hook":
 			h, err := parseHook(d)
 			if err != nil {
@@ -529,6 +577,43 @@ func parseModelConfigBlock(d *caddyfile.Dispenser) (ModelConfig, error) {
 			return mc, nil
 		}
 	}
+}
+
+// parseLogitBiasBlock parses a `logit_bias <level> { ... }` block into a
+// jsontext.Value. The dispenser must be positioned on the level token, with
+// the block opening brace on the same line. Each line inside the block is a
+// `<token_id> <bias>` pair; the pairs are collected into a JSON object of the
+// form {"<token_id>": <bias>}. The bias is a float, or the literal token
+// `false`, which is emitted as JSON `false` (interpreted downstream as -Inf).
+func parseLogitBiasBlock(d *caddyfile.Dispenser) (jsontext.Value, error) {
+	// The dispenser is positioned on the level token, with the block-opening
+	// brace on the same line. The first NextBlock call both opens the block
+	// and lands on the first content token; subsequent calls advance until
+	// the matching closing brace is reached.
+	level := d.Nesting()
+	if !d.NextBlock(level) {
+		return nil, d.Errf("logit_bias requires a '{ ... }' block")
+	}
+	pairs := map[string]jsontext.Value{}
+	for {
+		// The current token is the token_id; the next argument is the bias.
+		tokenID := d.Val()
+		if !d.NextArg() {
+			return nil, d.ArgErr()
+		}
+		valToken := d.Val()
+		val := jsontext.Value(valToken)
+		switch val.Kind() {
+		case 'f', '0':
+		default:
+			return nil, d.Errf("%s is not a vaild logit bias value", valToken)
+		}
+		pairs[tokenID] = val
+		if !d.NextBlock(level) {
+			break
+		}
+	}
+	return json.Marshal(pairs)
 }
 
 // parseHook parses a `hook <type> <url> { ... }` directive (the block is

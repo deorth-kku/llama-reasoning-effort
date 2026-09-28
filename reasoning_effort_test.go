@@ -399,6 +399,270 @@ func TestUnmarshalCaddyfileModelBlockInvalidValue(t *testing.T) {
 	}
 }
 
+// TestLogitBiasSetWhenLevelInMap verifies that when the request's
+// reasoning_effort is present in the LogitBias map, the mapped logit_bias
+// value is written to the downstream request body.
+func TestLogitBiasSetWhenLevelInMap(t *testing.T) {
+	m := ReasoningEffort{
+		Path: defaultPath,
+		LogitBias: map[string]jsontext.Value{
+			"medium": []byte(`{"50256":-100}`),
+		},
+	}
+	cap := runHandler(t, m, `{"reasoning_effort":"medium"}`, defaultPath)
+
+	var got map[string]any
+	if err := json.Unmarshal(cap.body, &got); err != nil {
+		t.Fatalf("downstream body not valid json: %v", err)
+	}
+	lb, ok := got["logit_bias"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected logit_bias to be an object, got %v (type %T)", got["logit_bias"], got["logit_bias"])
+	}
+	if lb["50256"] != float64(-100) {
+		t.Errorf("expected logit_bias[50256]=-100, got %v", lb["50256"])
+	}
+}
+
+// TestLogitBiasNotSetWhenLevelNotInMap verifies that when the request's
+// reasoning_effort is not in the LogitBias map, no logit_bias is written.
+func TestLogitBiasNotSetWhenLevelNotInMap(t *testing.T) {
+	m := ReasoningEffort{
+		Path: defaultPath,
+		LogitBias: map[string]jsontext.Value{
+			"high": []byte(`{"50256":-100}`),
+		},
+	}
+	cap := runHandler(t, m, `{"reasoning_effort":"medium"}`, defaultPath)
+
+	var got map[string]any
+	if err := json.Unmarshal(cap.body, &got); err != nil {
+		t.Fatalf("downstream body not valid json: %v", err)
+	}
+	if _, ok := got["logit_bias"]; ok {
+		t.Errorf("expected logit_bias to be absent for unknown value, got %v", got["logit_bias"])
+	}
+}
+
+// TestLogitBiasPreservedWhenNotMapped verifies that a logit_bias already
+// present in the request is preserved unchanged when the level is not in the
+// LogitBias map.
+func TestLogitBiasPreservedWhenNotMapped(t *testing.T) {
+	m := ReasoningEffort{
+		Path: defaultPath,
+		LogitBias: map[string]jsontext.Value{
+			"high": []byte(`{"50256":-100}`),
+		},
+	}
+	cap := runHandler(t, m, `{"reasoning_effort":"medium","logit_bias":{"999":5}}`, defaultPath)
+
+	var got map[string]any
+	if err := json.Unmarshal(cap.body, &got); err != nil {
+		t.Fatalf("downstream body not valid json: %v", err)
+	}
+	lb, ok := got["logit_bias"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected logit_bias to be preserved, got %v (type %T)", got["logit_bias"], got["logit_bias"])
+	}
+	if lb["999"] != float64(5) {
+		t.Errorf("expected logit_bias[999]=5, got %v", lb["999"])
+	}
+}
+
+// TestModelLogitBiasOverride verifies that a per-model LogitBias fully
+// overrides the top-level LogitBias when the request's model matches.
+func TestModelLogitBiasOverride(t *testing.T) {
+	m := ReasoningEffort{
+		Path: defaultPath,
+		LogitBias: map[string]jsontext.Value{
+			"medium": []byte(`{"1":1}`),
+		},
+		ModelConfigs: map[string]ModelConfig{
+			"llama-4": {
+				LogitBias: map[string]jsontext.Value{
+					"medium": []byte(`{"2":2}`),
+				},
+			},
+		},
+	}
+	cap := runHandler(t, m, `{"model":"llama-4","reasoning_effort":"medium"}`, defaultPath)
+
+	var got map[string]any
+	if err := json.Unmarshal(cap.body, &got); err != nil {
+		t.Fatalf("downstream body not valid json: %v", err)
+	}
+	lb, ok := got["logit_bias"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected logit_bias to be an object, got %v (type %T)", got["logit_bias"], got["logit_bias"])
+	}
+	if lb["2"] != float64(2) {
+		t.Errorf("expected model logit_bias[2]=2, got %v", lb["2"])
+	}
+	if _, ok := lb["1"]; ok {
+		t.Errorf("expected top-level logit_bias[1] to be overridden, got %v", lb["1"])
+	}
+}
+
+// TestRemoveRemovesReasoningEffort verifies that when Remove is set, the
+// reasoning_effort field is stripped from the downstream request body.
+func TestRemoveRemovesReasoningEffort(t *testing.T) {
+	m := ReasoningEffort{Path: defaultPath, Remove: true}
+	cap := runHandler(t, m, `{"reasoning_effort":"medium"}`, defaultPath)
+
+	var got map[string]any
+	if err := json.Unmarshal(cap.body, &got); err != nil {
+		t.Fatalf("downstream body not valid json: %v", err)
+	}
+	if _, ok := got["reasoning_effort"]; ok {
+		t.Errorf("expected reasoning_effort to be removed, got %v", got["reasoning_effort"])
+	}
+}
+
+// TestRemoveNotSetKeepsReasoningEffort verifies that when Remove is not set,
+// the reasoning_effort field is preserved in the downstream request body.
+func TestRemoveNotSetKeepsReasoningEffort(t *testing.T) {
+	m := ReasoningEffort{Path: defaultPath}
+	cap := runHandler(t, m, `{"reasoning_effort":"medium"}`, defaultPath)
+
+	var got map[string]any
+	if err := json.Unmarshal(cap.body, &got); err != nil {
+		t.Fatalf("downstream body not valid json: %v", err)
+	}
+	if got["reasoning_effort"] != "medium" {
+		t.Errorf("expected reasoning_effort preserved, got %v", got["reasoning_effort"])
+	}
+}
+
+func TestUnmarshalCaddyfileLogitBias(t *testing.T) {
+	input := `reasoning_effort {
+		logit_bias medium {
+			50256 -100
+			50257 50
+		}
+	}`
+	d := caddyfile.NewTestDispenser(input)
+	var m ReasoningEffort
+	if err := m.UnmarshalCaddyfile(d); err != nil {
+		t.Fatalf("UnmarshalCaddyfile error: %v", err)
+	}
+	bias, ok := m.LogitBias["medium"]
+	if !ok {
+		t.Fatalf("expected logit_bias[medium] to be set, got %#v", m.LogitBias)
+	}
+	var got map[string]float64
+	if err := json.Unmarshal(bias, &got); err != nil {
+		t.Fatalf("logit_bias not valid json: %v", err)
+	}
+	if got["50256"] != -100 {
+		t.Errorf("expected logit_bias[50256]=-100, got %v", got["50256"])
+	}
+	if got["50257"] != 50 {
+		t.Errorf("expected logit_bias[50257]=50, got %v", got["50257"])
+	}
+}
+
+// TestUnmarshalCaddyfileLogitBiasFalse verifies that the literal token
+// `false` is emitted as JSON `false` (interpreted downstream as -Inf).
+func TestUnmarshalCaddyfileLogitBiasFalse(t *testing.T) {
+	input := `reasoning_effort {
+		logit_bias medium {
+			50256 false
+			50257 -100
+		}
+	}`
+	d := caddyfile.NewTestDispenser(input)
+	var m ReasoningEffort
+	if err := m.UnmarshalCaddyfile(d); err != nil {
+		t.Fatalf("UnmarshalCaddyfile error: %v", err)
+	}
+	bias, ok := m.LogitBias["medium"]
+	if !ok {
+		t.Fatalf("expected logit_bias[medium] to be set, got %#v", m.LogitBias)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(bias, &got); err != nil {
+		t.Fatalf("logit_bias not valid json: %v", err)
+	}
+	if v, ok := got["50256"].(bool); !ok || v != false {
+		t.Errorf("expected logit_bias[50256]=false, got %v (type %T)", got["50256"], got["50256"])
+	}
+	if got["50257"] != float64(-100) {
+		t.Errorf("expected logit_bias[50257]=-100, got %v", got["50257"])
+	}
+}
+
+func TestUnmarshalCaddyfileRemove(t *testing.T) {
+	input := `reasoning_effort {
+		remove
+	}`
+	d := caddyfile.NewTestDispenser(input)
+	var m ReasoningEffort
+	if err := m.UnmarshalCaddyfile(d); err != nil {
+		t.Fatalf("UnmarshalCaddyfile error: %v", err)
+	}
+	if !m.Remove {
+		t.Errorf("expected remove to be true")
+	}
+}
+
+func TestUnmarshalCaddyfileLogitBiasInvalidValue(t *testing.T) {
+	input := `reasoning_effort {
+		logit_bias medium {
+			50256 notanumber
+		}
+	}`
+	d := caddyfile.NewTestDispenser(input)
+	var m ReasoningEffort
+	if err := m.UnmarshalCaddyfile(d); err == nil {
+		t.Fatal("expected error for invalid logit_bias value, got nil")
+	}
+}
+
+func TestUnmarshalCaddyfileLogitBiasMissingBraces(t *testing.T) {
+	input := `reasoning_effort {
+		logit_bias medium
+	}`
+	d := caddyfile.NewTestDispenser(input)
+	var m ReasoningEffort
+	if err := m.UnmarshalCaddyfile(d); err == nil {
+		t.Fatal("expected error for logit_bias without braces, got nil")
+	}
+}
+
+func TestUnmarshalCaddyfileModelBlockLogitBias(t *testing.T) {
+	input := `reasoning_effort {
+		model llama-4 {
+			logit_bias medium {
+				50256 -100
+			}
+			remove
+		}
+	}`
+	d := caddyfile.NewTestDispenser(input)
+	var m ReasoningEffort
+	if err := m.UnmarshalCaddyfile(d); err != nil {
+		t.Fatalf("UnmarshalCaddyfile error: %v", err)
+	}
+	mc, ok := m.ModelConfigs["llama-4"]
+	if !ok {
+		t.Fatalf("expected llama-4 in ModelConfigs, got %#v", m.ModelConfigs)
+	}
+	bias, ok := mc.LogitBias["medium"]
+	if !ok {
+		t.Fatalf("expected model logit_bias[medium] to be set, got %#v", mc.LogitBias)
+	}
+	var got map[string]float64
+	if err := json.Unmarshal(bias, &got); err != nil {
+		t.Fatalf("model logit_bias not valid json: %v", err)
+	}
+	if got["50256"] != -100 {
+		t.Errorf("expected model logit_bias[50256]=-100, got %v", got["50256"])
+	}
+	if !mc.Remove {
+		t.Errorf("expected model remove to be true")
+	}
+}
+
 // TestModelConfigOverride verifies that a per-model config selected by the
 // request's model field is used instead of the default config.
 func TestModelConfigOverride(t *testing.T) {
@@ -532,7 +796,7 @@ func (r *hookRecorder) handler(w http.ResponseWriter, req *http.Request) {
 // wait blocks until n requests have been received, or times out.
 func (r *hookRecorder) wait(t *testing.T, n int) {
 	t.Helper()
-	for i := 0; i < n; i++ {
+	for i := range n {
 		select {
 		case <-r.signal:
 		case <-time.After(2 * time.Second):

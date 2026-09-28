@@ -253,7 +253,7 @@ func TestSlotLRUConcurrentPersistsDoNotCollide(t *testing.T) {
 	l2 := newSlotLRU(fs, 5, zap.NewNop())
 
 	var wg sync.WaitGroup
-	for i := 0; i < 8; i++ {
+	for range 8 {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()

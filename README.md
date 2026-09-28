@@ -22,6 +22,10 @@ example.com {
             map high 8192
             map xhigh 32768
             map max -1
+            logit_bias high {
+                50256 false
+            }
+            remove
             model llama-4 {
                 to_chat_template_key effort
                 map medium 4096
@@ -46,6 +50,10 @@ Or use JSON config:
             "xhigh": 8192,
             "max": -1
         },
+        "logit_bias": {
+            "high": {"50256": false}
+        },
+        "remove": true,
         "model_configs": {
             "llama-4": {
                 "to_chat_template_key": "effort",
@@ -66,7 +74,9 @@ Or use JSON config:
 | `models_path` | string | The request path for the llama.cpp `/v1/models` listing. See [/v1/models meta.n_ctx injection](#v1-models-meta_ctx-injection). Defaults to `/v1/models`. |
 | `map` | string → int | Maps a `reasoning_effort` value to the `thinking_budget_tokens` value. A value of `0` sets `chat_template_kwargs.enable_thinking` to `false` instead. |
 | `to_chat_template_key` | string | If set, the `reasoning_effort` value is also written into `chat_template_kwargs` under this key. |
-| `model_configs` | model name → config | Per-model overrides. Each entry supports the same `map`, `to_chat_template_key`, and `hooks` options as the top level. |
+| `logit_bias` | string → JSON value | Maps a `reasoning_effort` value to a `logit_bias` value written to the request (replacing any existing `logit_bias`). The value is a raw JSON value — an object of token id → bias, a `[[id, bias]]` array, etc. A bias of `false` means `-Inf`. |
+| `remove` | bool | When set, the `reasoning_effort` field is stripped from the downstream request body. |
+| `model_configs` | model name → config | Per-model overrides. Each entry supports the same `map`, `to_chat_template_key`, `logit_bias`, `remove`, and `hooks` options as the top level. |
 | `hooks` | hook → config | (Top level) An ordered list of hooks fired for every matching request. See [Hooks](#hooks). |
 | `slot_save_path` | string | Where llama-server's slot save files live: a local directory (llama-server's `--slot-save-path`) or an `smb://` URL pointing at the same directory on an SMB share. Setting it enables the slot file LRU and the `action=delete` handler. See [Slot file LRU and delete](#slot-file-lru-and-delete). |
 | `slot_lru_max` | int | Maximum number of tracked slot save files. Zero (default) tracks files without evicting. Requires `slot_save_path`. |
@@ -86,8 +96,10 @@ model llama-4 {
 2. It reads the request body, decodes it as JSON, and looks for a top-level field named `reasoning_effort`.
 3. The config in use is selected by the request's `model` field: if `model` matches a key in `model_configs`, that per-model config is used; otherwise the default (top-level) config applies. A per-model config is a full override — entries missing from it are not inherited from the default config.
 4. If the `reasoning_effort` value matches an entry in the config's `map`, the corresponding `thinking_budget_tokens` is set. A budget of `0` instead sets `chat_template_kwargs.enable_thinking` to `false`.
-5. If `to_chat_template_key` is set, the `reasoning_effort` value is also written into `chat_template_kwargs` under that key.
-6. If the JSON is invalid or the top-level object doesn't contain `reasoning_effort`, the request is forwarded unchanged.
+5. If the `reasoning_effort` value matches an entry in the config's `logit_bias`, the corresponding `logit_bias` value is written to the request, replacing any existing `logit_bias`.
+6. If `to_chat_template_key` is set, the `reasoning_effort` value is also written into `chat_template_kwargs` under that key.
+7. If `remove` is set, the `reasoning_effort` field is stripped from the downstream request body.
+8. If the JSON is invalid or the top-level object doesn't contain `reasoning_effort`, the request is forwarded unchanged.
 
 ## /v1/models meta.n_ctx injection
 

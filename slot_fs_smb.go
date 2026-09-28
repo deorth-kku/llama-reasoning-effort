@@ -82,9 +82,9 @@ func parseSMBURL(raw string) (*smbURL, error) {
 	if rest == "" {
 		return nil, fmt.Errorf("invalid smb URL %q: share name is required", redactSMBURL(raw))
 	}
-	if i := strings.IndexByte(rest, '/'); i >= 0 {
-		out.share = rest[:i]
-		out.root = rest[i+1:]
+	if before, after, ok := strings.Cut(rest, "/"); ok {
+		out.share = before
+		out.root = after
 	} else {
 		out.share = rest
 	}
@@ -215,12 +215,10 @@ func isConnErr(err error) bool {
 	if err == nil {
 		return false
 	}
-	var te *smb2.TransportError
-	if errors.As(err, &te) {
+	if _, ok := errors.AsType[*smb2.TransportError](err); ok {
 		return true
 	}
-	var ce *smb2.ContextError
-	if errors.As(err, &ce) {
+	if _, ok := errors.AsType[*smb2.ContextError](err); ok {
 		return true
 	}
 	return false
