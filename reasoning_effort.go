@@ -56,12 +56,12 @@ const defaultHookContentType = "text/plain; charset=utf-8"
 type ReasoningEffort struct {
 	// Path is the request path on which the transformation is applied.
 	// Defaults to "/v1/chat/completions".
-	Path string `json:"path,omitempty"`
+	Path string `json:"path,omitzero"`
 
 	// ModelsPath is the request path for the llama.cpp /v1/models listing.
 	// meta.n_ctx is synthesized for models that lack it, taken from the
 	// server's --ctx-size argument. Defaults to "/v1/models".
-	ModelsPath string `json:"models_path,omitempty"`
+	ModelsPath string `json:"models_path,omitzero"`
 
 	// SlotSavePath is where llama-server's slot save files live. It is
 	// either a local directory (llama-server's --slot-save-path) or an
@@ -70,11 +70,11 @@ type ReasoningEffort struct {
 	// pointing at the same directory on an SMB share. Setting it enables
 	// the slot file LRU (for save/restore tracking and eviction) and the
 	// action=delete handler.
-	SlotSavePath string `json:"slot_save_path,omitempty"`
+	SlotSavePath string `json:"slot_save_path,omitzero"`
 
 	// SlotLRUMax is the maximum number of tracked slot save files.
 	// Zero (the default) tracks files without evicting any.
-	SlotLRUMax int `json:"slot_lru_max,omitempty"`
+	SlotLRUMax int `json:"slot_lru_max,omitzero"`
 
 	ModelConfig
 	ModelConfigs map[string]ModelConfig `json:"model_configs,omitzero"`
@@ -102,8 +102,8 @@ type ModelConfig struct {
 	// Map maps a reasoning_effort value (e.g. "medium") to the
 	// corresponding thinking_budget_tokens value. There is no built-in
 	// default mapping; values absent from the map are left unchanged.
-	Map               map[string]int64 `json:"map,omitempty"`
-	ToChatTemplateKey string           `json:"to_chat_template_key,omitempty"`
+	Map               map[string]int64 `json:"map,omitzero"`
+	ToChatTemplateKey string           `json:"to_chat_template_key,omitzero"`
 
 	// Hooks is the ordered list of hooks fired for requests targeting the
 	// model this config applies to. When a request's model matches a
@@ -121,16 +121,16 @@ type Hook struct {
 	Type string `json:"type"`
 
 	// Command is reserved for a future "command" hook type.
-	Command string `json:"command,omitempty"`
+	Command string `json:"command,omitzero"`
 
 	// HTTP hook configuration (used when Type == "http").
-	URL         string         `json:"url,omitempty"`
-	Method      string         `json:"method,omitempty"`
+	URL         string         `json:"url,omitzero"`
+	Method      string         `json:"method,omitzero"`
 	BodyJSON    jsontext.Value `json:"body_json,omitzero"`
-	Body        string         `json:"body,omitempty"`
-	ContentType string         `json:"content_type,omitempty"`
-	Timeout     time.Duration  `json:"timeout,omitempty"`
-	Blocking    bool           `json:"blocking,omitempty"`
+	Body        string         `json:"body,omitzero"`
+	ContentType string         `json:"content_type,omitzero"`
+	Timeout     time.Duration  `json:"timeout,omitzero"`
+	Blocking    bool           `json:"blocking,omitzero"`
 }
 
 // RequestBody is the JSON shape we care about for the transformation.
