@@ -290,10 +290,10 @@ func stringSliceEqual(got []any, want []string) bool {
 }
 
 // TestServeModelsInjectsSupportedEffort verifies reasoning.supported_effort
-// is synthesized from the config's Map/LogitBias keys: the top-level config
-// applies to models without a per-model config, a matching per-model config
-// wins, the keys are the sorted union of map and logit_bias, and pass-through
-// fields survive the re-serialization.
+// is synthesized from the config's Map/LogitBias/ReasoningLogitBias keys:
+// the top-level config applies to models without a per-model config, a
+// matching per-model config wins, the keys are the sorted union of the
+// three maps, and pass-through fields survive the re-serialization.
 func TestServeModelsInjectsSupportedEffort(t *testing.T) {
 	body := `{
   "object": "model.list",
@@ -312,6 +312,10 @@ func TestServeModelsInjectsSupportedEffort(t *testing.T) {
 				},
 				LogitBias: map[string]jsontext.Value{
 					"high": []byte(`{"50256":false}`),
+				},
+				ReasoningLogitBias: map[string]jsontext.Value{
+					"minimal": []byte(`{"50256":false}`),
+					"medium":  nil,
 				},
 			},
 		},
@@ -348,10 +352,10 @@ func TestServeModelsInjectsSupportedEffort(t *testing.T) {
 	if got, ok := getEfforts("test-model-a"); !ok || !stringSliceEqual(got, []string{"high", "low", "max", "medium", "minimal", "xhigh"}) {
 		t.Errorf("expected test-model-a supported_effort=[high low max medium minimal xhigh], got %v (present=%v)", got, ok)
 	}
-	// test-model-b uses its per-model config: the union of its map and
-	// logit_bias keys, sorted.
-	if got, ok := getEfforts("test-model-b"); !ok || !stringSliceEqual(got, []string{"high", "low", "medium"}) {
-		t.Errorf("expected test-model-b supported_effort=[high low medium], got %v (present=%v)", got, ok)
+	// test-model-b uses its per-model config: the union of its map,
+	// logit_bias, and reasoning_logit_bias keys, sorted.
+	if got, ok := getEfforts("test-model-b"); !ok || !stringSliceEqual(got, []string{"high", "low", "medium", "minimal"}) {
+		t.Errorf("expected test-model-b supported_effort=[high low medium minimal], got %v (present=%v)", got, ok)
 	}
 
 	// Pass-through fields must survive the re-serialization.
@@ -420,10 +424,16 @@ func TestSupportedEfforts(t *testing.T) {
 		{"empty", ModelConfig{}, nil},
 		{"map only", ModelConfig{Map: map[string]int64{"high": 1, "low": 2}}, []string{"high", "low"}},
 		{"logit_bias only", ModelConfig{LogitBias: map[string]jsontext.Value{"medium": nil}}, []string{"medium"}},
+		{"reasoning_logit_bias only", ModelConfig{ReasoningLogitBias: map[string]jsontext.Value{"medium": nil}}, []string{"medium"}},
 		{"union deduped", ModelConfig{
 			Map:       map[string]int64{"high": 1, "low": 2},
 			LogitBias: map[string]jsontext.Value{"high": nil, "max": nil},
 		}, []string{"high", "low", "max"}},
+		{"all three deduped", ModelConfig{
+			Map:                map[string]int64{"high": 1, "low": 2},
+			LogitBias:          map[string]jsontext.Value{"high": nil, "max": nil},
+			ReasoningLogitBias: map[string]jsontext.Value{"max": nil, "minimal": nil},
+		}, []string{"high", "low", "max", "minimal"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

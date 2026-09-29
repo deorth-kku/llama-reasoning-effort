@@ -102,10 +102,11 @@ type ModelConfig struct {
 	// Map maps a reasoning_effort value (e.g. "medium") to the
 	// corresponding thinking_budget_tokens value. There is no built-in
 	// default mapping; values absent from the map are left unchanged.
-	Map               map[string]int64          `json:"map,omitzero"`
-	LogitBias         map[string]jsontext.Value `json:"logit_bias,omitzero"`
-	ToChatTemplateKey string                    `json:"to_chat_template_key,omitzero"`
-	Remove            bool                      `json:"remove,omitzero"`
+	Map                map[string]int64          `json:"map,omitzero"`
+	LogitBias          map[string]jsontext.Value `json:"logit_bias,omitzero"`
+	ReasoningLogitBias map[string]jsontext.Value `json:"reasoning_logit_bias,omitzero"`
+	ToChatTemplateKey  string                    `json:"to_chat_template_key,omitzero"`
+	Remove             bool                      `json:"remove,omitzero"`
 
 	// Hooks is the ordered list of hooks fired for requests targeting the
 	// model this config applies to. When a request's model matches a
@@ -144,6 +145,7 @@ type RequestBody struct {
 	ReasoningEffort    string         `json:"reasoning_effort,omitzero"`
 	ChatTemplateKwargs kwargs         `json:"chat_template_kwargs,omitzero"`
 	LogitBias          jsontext.Value `json:"logit_bias,omitzero"`
+	ReasoningLogitBias jsontext.Value `json:"reasoning_logit_bias,omitzero"`
 	ThinkingBudget     int64          `json:"thinking_budget_tokens,omitzero"`
 	Inline             jsontext.Value `json:",embed"`
 }
@@ -289,14 +291,10 @@ func (m ReasoningEffort) ServeHTTP(w http.ResponseWriter, r *http.Request, next 
 		}
 
 		// Look up logit_bias (only when the level is present in the map).
-		if logitBias := useconfig.LogitBias[level]; logitBias != nil {
-			log.Debug("mapped logit_bias", zap.String("reasoning_effort", level), zap.String("logit_bias", string(logitBias)))
-			body.LogitBias = logitBias
-		} else if len(useconfig.LogitBias) > 0 {
-			// Only log when a logit_bias map is configured; otherwise the
-			// value is simply not mapped and there is nothing to report.
-			log.Info("skipping logit_bias: unknown reasoning_effort value", zap.String("value", level))
-		}
+		applyLogitBias(log, &body.LogitBias, useconfig.LogitBias, level, "logit_bias")
+		// Look up reasoning_logit_bias (only when the level is present in
+		// the map); the server applies it to the reasoning phase only.
+		applyLogitBias(log, &body.ReasoningLogitBias, useconfig.ReasoningLogitBias, level, "reasoning_logit_bias")
 
 		if useconfig.ToChatTemplateKey != "" {
 			if body.ChatTemplateKwargs.Inline == nil {
@@ -320,6 +318,21 @@ func (m ReasoningEffort) ServeHTTP(w http.ResponseWriter, r *http.Request, next 
 	r.Header.Del("Content-Length")
 
 	return next.ServeHTTP(w, r)
+}
+
+// applyLogitBias looks up level in biasMap and, when found, writes the
+// mapped value into field. When the level is absent from a configured map,
+// it logs a skip notice; when no map is configured at all, the value is
+// simply not mapped and nothing is logged.
+func applyLogitBias(log *zap.Logger, field *jsontext.Value, biasMap map[string]jsontext.Value, level, name string) {
+	if bias := biasMap[level]; bias != nil {
+		log.Debug("mapped "+name,
+			zap.String("reasoning_effort", level),
+			zap.String(name, string(bias)))
+		*field = bias
+	} else if len(biasMap) > 0 {
+		log.Info("skipping "+name+": unknown reasoning_effort value", zap.String("value", level))
+	}
 }
 
 // fireHook fires a single hook for the given request. It is best-effort:
@@ -482,6 +495,19 @@ func (m *ReasoningEffort) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					m.LogitBias = map[string]jsontext.Value{}
 				}
 				m.LogitBias[level] = bias
+			case "reasoning_logit_bias":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				level := d.Val()
+				bias, err := parseLogitBiasBlock(d)
+				if err != nil {
+					return err
+				}
+				if m.ReasoningLogitBias == nil {
+					m.ReasoningLogitBias = map[string]jsontext.Value{}
+				}
+				m.ReasoningLogitBias[level] = bias
 			case "remove":
 				m.Remove = true
 			case "model":
@@ -514,8 +540,8 @@ func (m *ReasoningEffort) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 // parseModelConfigBlock parses a `model <name> { ... }` block into a
 // ModelConfig. The dispenser must be positioned at the model name token,
 // with the block opening brace on the same line. Only `map`,
-// `to_chat_template_key`, `logit_bias`, `remove`, and `hook` are allowed
-// inside a model block.
+// `to_chat_template_key`, `logit_bias`, `reasoning_logit_bias`, `remove`,
+// and `hook` are allowed inside a model block.
 func parseModelConfigBlock(d *caddyfile.Dispenser) (ModelConfig, error) {
 	var mc ModelConfig
 	// The dispenser is positioned on the model name token, with the
@@ -562,6 +588,19 @@ func parseModelConfigBlock(d *caddyfile.Dispenser) (ModelConfig, error) {
 				mc.LogitBias = map[string]jsontext.Value{}
 			}
 			mc.LogitBias[level] = bias
+		case "reasoning_logit_bias":
+			if !d.NextArg() {
+				return mc, d.ArgErr()
+			}
+			level := d.Val()
+			bias, err := parseLogitBiasBlock(d)
+			if err != nil {
+				return mc, err
+			}
+			if mc.ReasoningLogitBias == nil {
+				mc.ReasoningLogitBias = map[string]jsontext.Value{}
+			}
+			mc.ReasoningLogitBias[level] = bias
 		case "remove":
 			mc.Remove = true
 		case "hook":

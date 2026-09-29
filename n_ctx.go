@@ -50,8 +50,8 @@ type modelMeta struct {
 // modelReasoning captures the reasoning capabilities block (an
 // OpenRouter-style field that llama-server does not provide).
 // SupportedEffort lists the reasoning_effort values the model accepts; it
-// is synthesized from the configured Map/LogitBias keys when upstream
-// omits it.
+// is synthesized from the configured Map/LogitBias/ReasoningLogitBias keys
+// when upstream omits it.
 type modelReasoning struct {
 	SupportedEffort []string       `json:"supported_effort,omitzero"`
 	Inline          jsontext.Value `json:",embed"`
@@ -117,9 +117,10 @@ func (b *bufferedResponseWriter) flush() error {
 // serveModels handles the /v1/models listing. It buffers the upstream
 // response and enriches every model entry: meta.n_ctx is injected from the
 // --ctx-size argument in status.args when missing, and
-// reasoning.supported_effort is filled from the Map/LogitBias keys of the
-// config selected by the entry's id. Non-JSON responses, error responses,
-// and responses without a data array are forwarded unchanged.
+// reasoning.supported_effort is filled from the Map/LogitBias/
+// ReasoningLogitBias keys of the config selected by the entry's id.
+// Non-JSON responses, error responses, and responses without a data array
+// are forwarded unchanged.
 func (m ReasoningEffort) serveModels(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	log := m.log
 	if log == nil {
@@ -167,10 +168,10 @@ func (m ReasoningEffort) serveModels(w http.ResponseWriter, r *http.Request, nex
 
 // patchModels enriches every model entry that is missing fields.
 // meta.n_ctx is read from the entry's status.args; reasoning.supported_effort
-// is the union of the Map and LogitBias keys of the config selected by the
-// entry's id (a matching per-model config wins over the top-level one).
-// Existing values always win over synthesized ones. It returns the number
-// of entries that gained n_ctx and reasoning respectively.
+// is the union of the Map, LogitBias, and ReasoningLogitBias keys of the
+// config selected by the entry's id (a matching per-model config wins over
+// the top-level one). Existing values always win over synthesized ones. It
+// returns the number of entries that gained n_ctx and reasoning respectively.
 func patchModels(resp *modelsResponse, def ModelConfig, perModel map[string]ModelConfig) (nctx, reasoning int) {
 	for i := range resp.Data {
 		e := &resp.Data[i]
@@ -184,7 +185,8 @@ func patchModels(resp *modelsResponse, def ModelConfig, perModel map[string]Mode
 			nctx++
 		}
 
-		// reasoning.supported_effort from the config's Map/LogitBias keys.
+		// reasoning.supported_effort from the config's Map/LogitBias/
+		// ReasoningLogitBias keys.
 		cfg := def
 		if mc, ok := perModel[e.ID]; ok {
 			cfg = mc
@@ -200,17 +202,20 @@ func patchModels(resp *modelsResponse, def ModelConfig, perModel map[string]Mode
 	return nctx, reasoning
 }
 
-// supportedEfforts returns the sorted union of the config's Map and
-// LogitBias keys, or nil when neither map is configured.
+// supportedEfforts returns the sorted union of the config's Map,
+// LogitBias and ReasoningLogitBias keys, or nil when none of them is configured.
 func supportedEfforts(cfg ModelConfig) []string {
-	if len(cfg.Map) == 0 && len(cfg.LogitBias) == 0 {
+	if len(cfg.Map) == 0 && len(cfg.LogitBias) == 0 && len(cfg.ReasoningLogitBias) == 0 {
 		return nil
 	}
-	set := make(map[string]struct{}, len(cfg.Map)+len(cfg.LogitBias))
+	set := make(map[string]struct{}, len(cfg.Map)+len(cfg.LogitBias)+len(cfg.ReasoningLogitBias))
 	for k := range cfg.Map {
 		set[k] = struct{}{}
 	}
 	for k := range cfg.LogitBias {
+		set[k] = struct{}{}
+	}
+	for k := range cfg.ReasoningLogitBias {
 		set[k] = struct{}{}
 	}
 	out := make([]string, 0, len(set))
