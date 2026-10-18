@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -117,17 +118,22 @@ type ModelConfig struct {
 }
 
 // Hook is a single hook configuration. The Type field is a discriminator
-// that selects the hook implementation; only "http" is supported today,
-// with "command" reserved for future use.
+// that selects the hook implementation; "http" and "unload" are supported
+// today, with "command" reserved for future use.
 type Hook struct {
-	// Type selects the hook implementation. Currently only "http" is
-	// supported; "command" is reserved for future use.
+	// Type selects the hook implementation. "http" fires a single
+	// outbound request; "unload" lists the llama.cpp server's models
+	// and unloads every loaded one. "command" is reserved for future
+	// use.
 	Type string `json:"type"`
 
 	// Command is reserved for a future "command" hook type.
 	Command string `json:"command,omitzero"`
 
-	// HTTP hook configuration (used when Type == "http").
+	// HTTP hook configuration (used when Type == "http"). For the
+	// "unload" type, URL is the base URL of the llama.cpp server
+	// (e.g. "http://127.0.0.1:8080"); the hook calls its /models and
+	// /models/unload endpoints.
 	URL         string         `json:"url,omitzero"`
 	Method      string         `json:"method,omitzero"`
 	BodyJSON    jsontext.Value `json:"body_json,omitzero"`
@@ -210,9 +216,9 @@ func validateHooks(hooks []Hook) error {
 			return fmt.Errorf("hooks[%d]: type is required", i)
 		}
 		switch h.Type {
-		case "http":
+		case "http", "unload":
 			if h.URL == "" {
-				return fmt.Errorf("hooks[%d] (type http): url is required", i)
+				return fmt.Errorf("hooks[%d] (type %s): url is required", i, h.Type)
 			}
 		case "command":
 			return fmt.Errorf("hooks[%d]: type \"command\" is not yet supported", i)
@@ -357,6 +363,10 @@ func (m *ReasoningEffort) fireHook(r *http.Request, hook Hook, originalBody []by
 		log.Warn("skipping hook: command type is not yet supported", zap.String("type", hook.Type))
 		return
 	}
+	if hook.Type == "unload" {
+		m.fireUnloadHook(r, hook)
+		return
+	}
 	if hook.Type != "http" {
 		log.Warn("skipping hook: unsupported type", zap.String("type", hook.Type))
 		return
@@ -445,6 +455,100 @@ func (m *ReasoningEffort) fireHook(r *http.Request, hook Hook, originalBody []by
 				zap.Error(err))
 		}
 	}()
+}
+
+// fireUnloadHook fires an "unload" hook: it lists the llama.cpp server's
+// models at hook.URL and unloads every model whose status is "loaded", by
+// POSTing /models/unload with {"model": "<id>"} for each one. Models that
+// are not loaded are skipped.
+//
+// Like all hooks it is best-effort: any error is logged and never
+// propagated, so the original request always proceeds. The hook's timeout
+// bounds the whole list-then-unload sequence, and Blocking controls whether
+// the sequence runs synchronously or in the background.
+func (m *ReasoningEffort) fireUnloadHook(r *http.Request, hook Hook) {
+	log := m.log
+	if log == nil {
+		log = zap.NewNop()
+	}
+
+	timeout := hook.Timeout
+	if timeout <= 0 {
+		timeout = defaultHookTimeout
+	}
+
+	// Fall back to the default client when the module was constructed
+	// directly (e.g. in tests) without going through Provision.
+	client := m.hookClient
+	if client == nil {
+		client = http.DefaultClient
+	}
+
+	work := func() {
+		// One context covers the entire list-then-unload sequence.
+		ctx, cancel := context.WithTimeout(r.Context(), timeout)
+		defer cancel()
+
+		base := strings.TrimSuffix(hook.URL, "/")
+
+		listReq, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/models", nil)
+		if err != nil {
+			log.Warn("unload hook: failed to build list request",
+				zap.String("url", hook.URL), zap.Error(err))
+			return
+		}
+		resp, err := client.Do(listReq)
+		if err != nil {
+			log.Warn("unload hook: model listing failed",
+				zap.String("url", hook.URL), zap.Error(err))
+			return
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			log.Warn("unload hook: failed to read model listing",
+				zap.String("url", hook.URL), zap.Error(err))
+			return
+		}
+		var listing modelsResponse
+		if err := json.Unmarshal(body, &listing); err != nil {
+			log.Warn("unload hook: model listing is not valid JSON",
+				zap.String("url", hook.URL), zap.Error(err))
+			return
+		}
+
+		for _, entry := range listing.Data {
+			if entry.Status.Value != "loaded" {
+				continue
+			}
+			payload, err := json.Marshal(map[string]string{"model": entry.ID})
+			if err != nil {
+				log.Warn("unload hook: failed to encode unload request",
+					zap.String("model", entry.ID), zap.Error(err))
+				continue
+			}
+			unloadReq, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/models/unload", bytes.NewReader(payload))
+			if err != nil {
+				log.Warn("unload hook: failed to build unload request",
+					zap.String("model", entry.ID), zap.Error(err))
+				continue
+			}
+			unloadReq.Header.Set("Content-Type", "application/json")
+			if _, err := client.Do(unloadReq); err != nil {
+				log.Warn("unload hook: unload request failed",
+					zap.String("model", entry.ID), zap.String("url", hook.URL), zap.Error(err))
+				continue
+			}
+			log.Debug("unloaded model", zap.String("model", entry.ID))
+		}
+	}
+
+	if hook.Blocking {
+		work()
+		return
+	}
+
+	go work()
 }
 
 // UnmarshalCaddyfile implements caddyfile.Unmarshaler.
@@ -662,9 +766,11 @@ func parseLogitBiasBlock(d *caddyfile.Dispenser) (jsontext.Value, error) {
 }
 
 // parseHook parses a `hook <type> <url> { ... }` directive (the block is
-// optional). The dispenser must be positioned on the `hook` token. Only the
-// `http` hook type is supported in the Caddyfile, and only the string `body`
-// field (no `body_json`, which is a JSON-config-file-only field).
+// optional). The dispenser must be positioned on the `hook` token. The
+// `http` and `unload` hook types are supported in the Caddyfile; only the
+// string `body` field is available (no `body_json`, which is a
+// JSON-config-file-only field). The `unload` type accepts only `timeout`
+// and `blocking` inside its block.
 func parseHook(d *caddyfile.Dispenser) (Hook, error) {
 	var hook Hook
 	// The dispenser is positioned on the `hook` token. The two following
@@ -677,8 +783,8 @@ func parseHook(d *caddyfile.Dispenser) (Hook, error) {
 		return hook, d.ArgErr()
 	}
 	hook.URL = d.Val()
-	if hook.Type != "http" {
-		return hook, d.Errf("unsupported hook type '%s' in Caddyfile (only 'http' is supported)", hook.Type)
+	if hook.Type != "http" && hook.Type != "unload" {
+		return hook, d.Errf("unsupported hook type '%s' in Caddyfile (only 'http' and 'unload' are supported)", hook.Type)
 	}
 
 	// The dispenser is positioned on the URL token, with the block-opening
@@ -691,16 +797,25 @@ func parseHook(d *caddyfile.Dispenser) (Hook, error) {
 	for {
 		switch d.Val() {
 		case "method":
+			if hook.Type == "unload" {
+				return hook, d.Errf("option 'method' is not supported for hook type 'unload'")
+			}
 			if !d.NextArg() {
 				return hook, d.ArgErr()
 			}
 			hook.Method = d.Val()
 		case "body":
+			if hook.Type == "unload" {
+				return hook, d.Errf("option 'body' is not supported for hook type 'unload'")
+			}
 			if !d.NextArg() {
 				return hook, d.ArgErr()
 			}
 			hook.Body = d.Val()
 		case "content_type":
+			if hook.Type == "unload" {
+				return hook, d.Errf("option 'content_type' is not supported for hook type 'unload'")
+			}
 			if !d.NextArg() {
 				return hook, d.ArgErr()
 			}

@@ -1363,6 +1363,101 @@ func TestHookBlocking(t *testing.T) {
 	rec.wait(t, 1)
 }
 
+// TestUnloadHookUnloadsOnlyLoadedModels verifies the "unload" hook lists
+// the server's models and posts /models/unload only for models whose status
+// is "loaded".
+func TestUnloadHookUnloadsOnlyLoadedModels(t *testing.T) {
+	var mu sync.Mutex
+	var unloads []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[` +
+				`{"id":"loaded-model","status":{"value":"loaded"}},` +
+				`{"id":"idle-model","status":{"value":"unloaded"}}]}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/models/unload":
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			unloads = append(unloads, string(body))
+			mu.Unlock()
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	m := ReasoningEffort{
+		Path: defaultPath,
+		Map:  newTestMap(),
+		Hooks: []Hook{{
+			Type:     "unload",
+			URL:      srv.URL,
+			Blocking: true,
+		}},
+	}
+	runHandler(t, m, `{"reasoning_effort":"high"}`, defaultPath)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(unloads) != 1 {
+		t.Fatalf("expected 1 unload request, got %d: %v", len(unloads), unloads)
+	}
+	if unloads[0] != `{"model":"loaded-model"}` {
+		t.Errorf("expected unload body {\"model\":\"loaded-model\"}, got %q", unloads[0])
+	}
+}
+
+// TestUnloadHookTrailingSlashURL verifies a hook URL with a trailing slash
+// is normalized before the /models path is appended.
+func TestUnloadHookTrailingSlashURL(t *testing.T) {
+	var mu sync.Mutex
+	unloaded := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/models":
+			_, _ = w.Write([]byte(`{"data":[{"id":"loaded-model","status":{"value":"loaded"}}]}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/models/unload":
+			mu.Lock()
+			unloaded = true
+			mu.Unlock()
+		}
+	}))
+	defer srv.Close()
+
+	m := ReasoningEffort{
+		Path:  defaultPath,
+		Map:   newTestMap(),
+		Hooks: []Hook{{Type: "unload", URL: srv.URL + "/", Blocking: true}},
+	}
+	runHandler(t, m, `{"reasoning_effort":"high"}`, defaultPath)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !unloaded {
+		t.Error("expected unload request for trailing-slash hook URL")
+	}
+}
+
+// TestUnloadHookFailureDoesNotBreakRequest verifies a failing unload hook
+// (the model listing returns 500) does not prevent the downstream request.
+func TestUnloadHookFailureDoesNotBreakRequest(t *testing.T) {
+	failSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer failSrv.Close()
+
+	m := ReasoningEffort{
+		Path:  defaultPath,
+		Map:   newTestMap(),
+		Hooks: []Hook{{Type: "unload", URL: failSrv.URL, Blocking: true}},
+	}
+	cap := runHandler(t, m, `{"reasoning_effort":"high"}`, defaultPath)
+	if cap.body == nil {
+		t.Fatal("expected downstream handler to run")
+	}
+}
+
 // TestHookInvalidJSONDoesNotFire verifies that when the request body is
 // invalid JSON, the transformation is skipped and no hooks fire.
 func TestHookInvalidJSONDoesNotFire(t *testing.T) {
@@ -1400,6 +1495,7 @@ func TestProvisionHookValidation(t *testing.T) {
 		{"missing type", []Hook{{URL: "http://x"}}},
 		{"unknown type", []Hook{{Type: "grpc", URL: "http://x"}}},
 		{"http without url", []Hook{{Type: "http"}}},
+		{"unload without url", []Hook{{Type: "unload"}}},
 		{"command not supported", []Hook{{Type: "command", Command: "echo hi"}}},
 	}
 	for _, tc := range tests {
@@ -1416,10 +1512,10 @@ func TestProvisionHookValidation(t *testing.T) {
 func TestProvisionValidHooks(t *testing.T) {
 	m := ReasoningEffort{
 		Path: defaultPath,
-		Hooks: []Hook{{
-			Type: "http",
-			URL:  "http://example.test/hook",
-		}},
+		Hooks: []Hook{
+			{Type: "http", URL: "http://example.test/hook"},
+			{Type: "unload", URL: "http://example.test:8080", Timeout: 10 * time.Second},
+		},
 		ModelConfigs: map[string]ModelConfig{
 			"llama-4": {Hooks: []Hook{{Type: "http", URL: "http://example.test/model-hook"}}},
 		},
@@ -1517,5 +1613,50 @@ func TestUnmarshalCaddyfileHookUnsupportedType(t *testing.T) {
 	var m ReasoningEffort
 	if err := m.UnmarshalCaddyfile(d); err == nil {
 		t.Fatal("expected error for unsupported hook type in Caddyfile, got nil")
+	}
+}
+
+// TestUnmarshalCaddyfileUnloadHook verifies parsing of the unload hook
+// directive, which accepts only timeout and blocking options.
+func TestUnmarshalCaddyfileUnloadHook(t *testing.T) {
+	input := `reasoning_effort {
+		hook unload http://example.test:8080 {
+			timeout 10s
+			blocking
+		}
+	}`
+	d := caddyfile.NewTestDispenser(input)
+	var m ReasoningEffort
+	if err := m.UnmarshalCaddyfile(d); err != nil {
+		t.Fatalf("UnmarshalCaddyfile error: %v", err)
+	}
+	if len(m.Hooks) != 1 {
+		t.Fatalf("expected 1 hook, got %d", len(m.Hooks))
+	}
+	h := m.Hooks[0]
+	if h.Type != "unload" {
+		t.Errorf("expected hook type unload, got %q", h.Type)
+	}
+	if h.URL != "http://example.test:8080" {
+		t.Errorf("unexpected hook URL: %q", h.URL)
+	}
+	if h.Timeout != 10*time.Second {
+		t.Errorf("expected timeout 10s, got %v", h.Timeout)
+	}
+	if !h.Blocking {
+		t.Error("expected blocking=true")
+	}
+}
+
+// TestUnmarshalCaddyfileUnloadHookRejectsHTTPOptions verifies that http-only
+// options are rejected inside an unload hook block.
+func TestUnmarshalCaddyfileUnloadHookRejectsHTTPOptions(t *testing.T) {
+	for _, opt := range []string{"method POST", "body hi", "content_type application/json"} {
+		input := "reasoning_effort {\n\thook unload http://example.test {\n\t\t" + opt + "\n\t}\n}"
+		d := caddyfile.NewTestDispenser(input)
+		var m ReasoningEffort
+		if err := m.UnmarshalCaddyfile(d); err == nil {
+			t.Fatalf("expected error for option %q in unload hook, got nil", opt)
+		}
 	}
 }

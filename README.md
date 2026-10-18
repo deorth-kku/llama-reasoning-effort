@@ -152,18 +152,18 @@ In addition to rewriting the body, the plugin can fire one or more outbound HTTP
 - Hooks are selected by the request's `model` field, exactly like the mapping config: if `model` matches a key in `model_configs`, that model's `hooks` array is used; otherwise the top-level `hooks` array is used. A per-model `hooks` array is a **full override** — it is not merged with the top-level hooks.
 - All hooks in the selected array fire, in declaration order.
 - Hook execution is **best-effort**: any error is logged, and a failing hook never blocks or fails the original request.
-- Each hook has a `type` discriminator. Only `"http"` is supported today; `"command"` is reserved for future use.
+- Each hook has a `type` discriminator. `"http"` and `"unload"` are supported today; `"command"` is reserved for future use.
 
 ### Options (per hook)
 
 | Option | Type | Description |
 | --- | --- | --- |
-| `type` | string | Hook discriminator. Currently only `"http"`. Required. |
-| `url` | string | Target URL for the hook request. Required when `type` is `"http"`. |
-| `method` | string | HTTP method for the hook request. Defaults to `POST`. |
-| `body` | string | Request body template. Supports [Caddy placeholders](https://caddyserver.com/docs/configuration-syntax/#placeholders) such as `{http.request.body}`. Only usable in the Caddyfile (single-line). |
-| `body_json` | JSON value | A raw JSON body, used verbatim (no placeholder resolution). JSON-config-file only; takes precedence over `body` when both are set. |
-| `content_type` | string | `Content-Type` for the hook request. Defaults to `application/json` when `body_json` is used, otherwise `text/plain; charset=utf-8` for a string `body`. |
+| `type` | string | Hook discriminator. `"http"` or `"unload"`. Required. |
+| `url` | string | Target URL for the hook request. Required when `type` is `"http"`. For `type` `"unload"`, the **base URL** of the llama.cpp server (e.g. `http://127.0.0.1:8080`); the hook calls its `/models` and `/models/unload` endpoints. |
+| `method` | string | (http only) HTTP method for the hook request. Defaults to `POST`. |
+| `body` | string | (http only) Request body template. Supports [Caddy placeholders](https://caddyserver.com/docs/configuration-syntax/#placeholders) such as `{http.request.body}`. Only usable in the Caddyfile (single-line). |
+| `body_json` | JSON value | (http only) A raw JSON body, used verbatim (no placeholder resolution). JSON-config-file only; takes precedence over `body` when both are set. |
+| `content_type` | string | (http only) `Content-Type` for the hook request. Defaults to `application/json` when `body_json` is used, otherwise `text/plain; charset=utf-8` for a string `body`. |
 | `timeout` | duration | Per-hook client timeout (e.g. `5s`, `200ms`). Defaults to `5s`. |
 | `blocking` | bool | When `false` (default), the hook fires asynchronously in the background and never blocks the request. When `true`, the request waits for the hook to complete. |
 
@@ -238,6 +238,44 @@ example.com {
 ```
 
 In the JSON config, `body_json` is written as a raw JSON value (e.g. `{"event": "request"}`), while `body` is a string template that supports Caddy placeholders.
+
+### The `unload` hook
+
+The `unload` hook type ejects loaded models from the llama.cpp server. For every matching request it:
+
+1. Lists the server's models via `GET {url}/models`.
+2. For every model whose `status.value` is `"loaded"`, unloads it via `POST {url}/models/unload` with body `{"model": "<id>"}`.
+
+Models that are not loaded are skipped. The hook's `url` is the base URL of the llama.cpp server (a trailing slash is tolerated); `timeout` bounds the whole list-then-unload sequence, and `blocking` has the same semantics as for `http` hooks. The hook is best-effort: a server that is unreachable or returns an error is logged, and the original request always proceeds. The `method`, `body`, `body_json`, and `content_type` options do not apply to this type.
+
+```caddyfile
+example.com {
+    handle /v1/chat/completions * {
+        reasoning_effort {
+            map medium 2048
+            hook unload http://127.0.0.1:8080 {
+                timeout 10s
+            }
+        }
+    }
+}
+```
+
+```json
+{
+    "handle": [{
+        "handler": "reasoning_effort",
+        "map": {"medium": 2048},
+        "hooks": [
+            {
+                "type": "unload",
+                "url": "http://127.0.0.1:8080",
+                "timeout": "10s"
+            }
+        ]
+    }]
+}
+```
 
 ## Slot file LRU and delete
 
