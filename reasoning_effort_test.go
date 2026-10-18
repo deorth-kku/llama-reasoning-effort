@@ -942,14 +942,23 @@ func TestDebugLogDataFieldIsJSONObject(t *testing.T) {
 	// logged, so we can assert on the transformed value.
 	runHandler(t, m, `{"model":"x","reasoning_effort":"medium"}`, defaultPath)
 
-	// zap emits newline-delimited JSON (JSONL); the full-body debug entry is
-	// the last line written by the middleware.
-	lines := strings.TrimSpace(buf.String())
-	lastLine := lines[strings.LastIndex(lines, "\n")+1:]
-
+	// zap emits newline-delimited JSON (JSONL). The full-body debug entry is
+	// the only line carrying a "data" field; locate it rather than assuming a
+	// position, since other entries (e.g. the post-response usage note) are
+	// also written to the same buffer.
 	var logLine map[string]any
-	if err := json.Unmarshal([]byte(lastLine), &logLine); err != nil {
-		t.Fatalf("log output not valid json: %v\nlog was: %s", err, buf.String())
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		var l map[string]any
+		if err := json.Unmarshal([]byte(line), &l); err != nil {
+			continue
+		}
+		if _, ok := l["data"]; ok {
+			logLine = l
+			break
+		}
+	}
+	if logLine == nil {
+		t.Fatalf("no full-body log entry found:\n%s", buf.String())
 	}
 
 	data, ok := logLine["data"].(map[string]any)

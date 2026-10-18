@@ -107,6 +107,7 @@ type ModelConfig struct {
 	ReasoningLogitBias map[string]jsontext.Value `json:"reasoning_logit_bias,omitzero"`
 	ToChatTemplateKey  string                    `json:"to_chat_template_key,omitzero"`
 	Remove             bool                      `json:"remove,omitzero"`
+	LogUsage           bool                      `json:"log_usage,omitzero"`
 
 	// Hooks is the ordered list of hooks fired for requests targeting the
 	// model this config applies to. When a request's model matches a
@@ -317,6 +318,11 @@ func (m ReasoningEffort) ServeHTTP(w http.ResponseWriter, r *http.Request, next 
 	r.ContentLength = -1
 	r.Header.Del("Content-Length")
 
+	if useconfig.LogUsage {
+		// Run the downstream handler with a writer that tees the SSE stream, then
+		// extract and log the usage asynchronously so the response is not delayed.
+		return m.serveChatCompletions(w, r, next, body.Model)
+	}
 	return next.ServeHTTP(w, r)
 }
 
