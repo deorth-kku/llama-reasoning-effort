@@ -504,14 +504,8 @@ func (m *ReasoningEffort) fireUnloadHook(r *http.Request, hook Hook) {
 			return
 		}
 		defer resp.Body.Close()
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			log.Warn("unload hook: failed to read model listing",
-				zap.String("url", hook.URL), zap.Error(err))
-			return
-		}
 		var listing modelsResponse
-		if err := json.Unmarshal(body, &listing); err != nil {
+		if err := json.UnmarshalRead(resp.Body, &listing); err != nil {
 			log.Warn("unload hook: model listing is not valid JSON",
 				zap.String("url", hook.URL), zap.Error(err))
 			return

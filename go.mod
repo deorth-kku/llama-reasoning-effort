@@ -4,7 +4,7 @@ go 1.27
 
 require (
 	github.com/caddyserver/caddy/v2 v2.11.4
-	github.com/deorth-kku/go-common v0.0.0-20260820000101-85debbe5c1b5
+	github.com/deorth-kku/go-common v0.0.0-20261019013507-fe718e4bb113
 	github.com/hirochachacha/go-smb2 v1.1.1-0.20260830081004-7245fbcee17a
 	go.uber.org/zap v1.28.0
 )

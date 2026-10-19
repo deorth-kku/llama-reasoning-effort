@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
 	"testing"
 
 	"github.com/caddyserver/caddy/v2"
@@ -183,36 +184,83 @@ func TestServeModelsNoCtxSizeUnchanged(t *testing.T) {
 	}
 }
 
-// TestServeModelsInvalidJSONForwarded verifies a non-JSON response is
-// forwarded byte-for-byte unchanged.
-func TestServeModelsInvalidJSONForwarded(t *testing.T) {
+// TestServeModelsInvalidJSONEmpty verifies that when the upstream response
+// is not valid JSON, the streaming decoder fails and an empty body is
+// returned (the bytes were consumed by the decoder and cannot be replayed).
+func TestServeModelsInvalidJSONEmpty(t *testing.T) {
 	const body = `{not valid json`
 	rec := runModelsResponse(t, ReasoningEffort{Map: newTestMap()}, defaultModelsPath, body, "application/json")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", rec.Code)
 	}
-	if rec.Body.String() != body {
-		t.Errorf("expected invalid JSON forwarded unchanged, got %q", rec.Body.String())
+	if rec.Body.String() != "" {
+		t.Errorf("expected empty body for invalid JSON, got %q", rec.Body.String())
 	}
 }
 
-// TestServeModelsNonJSONContentTypeForwarded verifies a non-JSON
-// Content-Type response is forwarded unchanged without attempting a patch.
-func TestServeModelsNonJSONContentTypeForwarded(t *testing.T) {
+// TestServeModelsNonJSONContentTypeEmpty verifies that a non-JSON response
+// (e.g. HTML) results in an empty body because the streaming decoder
+// cannot parse it.
+func TestServeModelsNonJSONContentTypeEmpty(t *testing.T) {
 	const body = `<html>not json</html>`
 	rec := runModelsResponse(t, ReasoningEffort{Map: newTestMap()}, defaultModelsPath, body, "text/html")
-	if rec.Body.String() != body {
-		t.Errorf("expected non-JSON response forwarded unchanged, got %q", rec.Body.String())
+	if rec.Body.String() != "" {
+		t.Errorf("expected empty body for non-JSON response, got %q", rec.Body.String())
 	}
 }
 
-// TestServeModelsEmptyDataForwarded verifies an empty data array is
-// forwarded unchanged.
-func TestServeModelsEmptyDataForwarded(t *testing.T) {
+// TestServeModelsEmptyDataReserialized verifies an empty data array is
+// re-serialized from the struct (not forwarded byte-for-byte).
+func TestServeModelsEmptyDataReserialized(t *testing.T) {
 	const body = `{"object":"model.list","data":[]}`
 	rec := runModelsResponse(t, ReasoningEffort{Map: newTestMap()}, defaultModelsPath, body, "application/json")
-	if rec.Body.String() != body {
-		t.Errorf("expected empty-data response forwarded unchanged, got %q", rec.Body.String())
+
+	var resp struct {
+		Object string           `json:"object"`
+		Data   []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("body not valid json: %v\n%s", err, rec.Body.String())
+	}
+	if resp.Object != "model.list" {
+		t.Errorf("expected object=model.list, got %q", resp.Object)
+	}
+	if len(resp.Data) != 0 {
+		t.Errorf("expected empty data, got %v", resp.Data)
+	}
+}
+
+// TestServeModelsStaleContentLength simulates an upstream that carries a
+// Content-Length header (as a reverse proxy forwards from a length-framed
+// response) and verifies the middleware does not commit the stale length:
+// the re-serialized, patched body is a different size than the upstream one.
+func TestServeModelsStaleContentLength(t *testing.T) {
+	m := ReasoningEffort{Map: newTestMap()}
+	m.ModelsPath = defaultModelsPath
+
+	req := httptest.NewRequest(http.MethodGet, defaultModelsPath, nil)
+	rec := httptest.NewRecorder()
+
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", strconv.Itoa(len(modelsPatchBody)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, modelsPatchBody)
+		return nil
+	})
+
+	if err := m.ServeHTTP(rec, req, next); err != nil {
+		t.Fatalf("ServeHTTP returned error: %v", err)
+	}
+
+	body := rec.Body.Bytes()
+	if len(body) == len(modelsPatchBody) {
+		t.Fatalf("test scenario ineffective: patched body has the same length as the upstream body")
+	}
+	if cl := rec.Header().Get("Content-Length"); cl != "" {
+		if got, _ := strconv.Atoi(cl); got != len(body) {
+			t.Errorf("stale Content-Length %s committed but re-serialized body is %d bytes", cl, len(body))
+		}
 	}
 }
 

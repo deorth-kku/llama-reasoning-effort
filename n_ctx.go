@@ -1,9 +1,8 @@
 package reasoningeffort
 
 import (
-	"bytes"
 	"encoding/json/jsontext"
-	"encoding/json/v2"
+	"io"
 	"net/http"
 	"slices"
 	"strconv"
@@ -57,113 +56,109 @@ type modelReasoning struct {
 	Inline          jsontext.Value `json:",embed"`
 }
 
-// bufferedResponseWriter wraps an http.ResponseWriter and buffers the body
-// (and records the status code) so the middleware can inspect and rewrite
-// the response before it is handed to the client. Headers are captured in a
-// private map so downstream writes never mutate the real writer until
-// flush runs.
-type bufferedResponseWriter struct {
+// streamingResponseWriter wraps an http.ResponseWriter and feeds body bytes
+// into an io.Writer (a cjson.JsonWriter) for streaming decode. Headers and
+// status are captured in a private map so the real writer is only committed
+// after the upstream handler completes.
+type streamingResponseWriter struct {
 	http.ResponseWriter
 	header      http.Header
 	statusCode  int
-	buf         bytes.Buffer
+	body        io.Writer
 	wroteHeader bool
 }
 
-func newBufferedResponseWriter(w http.ResponseWriter) *bufferedResponseWriter {
+func newStreamingResponseWriter(w http.ResponseWriter, body io.Writer) *streamingResponseWriter {
 	h := make(http.Header, len(w.Header()))
 	for k, vv := range w.Header() {
 		h[k] = append([]string(nil), vv...)
 	}
-	return &bufferedResponseWriter{
+	return &streamingResponseWriter{
 		ResponseWriter: w,
 		header:         h,
 		statusCode:     http.StatusOK,
+		body:           body,
 	}
 }
 
-// Header returns the buffered header map so downstream writes are captured
+// Header returns the captured header map so downstream writes are recorded
 // here instead of on the real writer.
-func (b *bufferedResponseWriter) Header() http.Header { return b.header }
+func (s *streamingResponseWriter) Header() http.Header { return s.header }
 
-func (b *bufferedResponseWriter) WriteHeader(code int) {
-	if b.wroteHeader {
+func (s *streamingResponseWriter) WriteHeader(code int) {
+	if s.wroteHeader {
 		return
 	}
-	b.statusCode = code
-	b.wroteHeader = true
+	s.statusCode = code
+	s.wroteHeader = true
 }
 
-func (b *bufferedResponseWriter) Write(p []byte) (int, error) {
-	if !b.wroteHeader {
-		b.WriteHeader(http.StatusOK)
+// Write feeds body bytes to the streaming decoder.
+func (s *streamingResponseWriter) Write(p []byte) (int, error) {
+	if !s.wroteHeader {
+		s.WriteHeader(http.StatusOK)
 	}
-	return b.buf.Write(p)
+	return s.body.Write(p)
 }
 
-// flush writes the recorded status, headers, and body to the real writer.
-func (b *bufferedResponseWriter) flush() error {
-	h := b.ResponseWriter.Header()
-	for k, vv := range b.header {
+// commit writes the recorded status and headers to the real writer. The
+// caller is responsible for writing the response body afterwards.
+// Length-framing headers captured from upstream are dropped: the response
+// body is re-serialized (or empty on decode failure) and has a different
+// length, so net/http must re-frame it.
+func (s *streamingResponseWriter) commit() {
+	h := s.ResponseWriter.Header()
+	for k, vv := range s.header {
 		for _, v := range vv {
 			h.Add(k, v)
 		}
 	}
-	b.ResponseWriter.WriteHeader(b.statusCode)
-	_, err := b.ResponseWriter.Write(b.buf.Bytes())
-	return err
+	h.Del("Content-Length")
+	h.Del("Transfer-Encoding")
+	s.ResponseWriter.WriteHeader(s.statusCode)
 }
 
-// serveModels handles the /v1/models listing. It buffers the upstream
-// response and enriches every model entry: meta.n_ctx is injected from the
-// --ctx-size argument in status.args when missing, and
-// reasoning.supported_effort is filled from the Map/LogitBias/
-// ReasoningLogitBias keys of the config selected by the entry's id.
-// Non-JSON responses, error responses, and responses without a data array
-// are forwarded unchanged.
+// serveModels handles the /v1/models listing. It streams the upstream
+// response into a modelsResponse struct via cjson.JsonWriter, enriches every
+// model entry (meta.n_ctx from --ctx-size, reasoning.supported_effort from
+// the config), then streams the patched struct back out via cjson.JsonReader.
+// No large []byte is ever allocated for the full response.
 func (m ReasoningEffort) serveModels(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	log := m.log
 	if log == nil {
 		log = zap.NewNop()
 	}
 
-	bw := newBufferedResponseWriter(w)
-	if err := next.ServeHTTP(bw, r); err != nil {
+	var resp modelsResponse
+	jw := cjson.NewJsonWriter(&resp)
+	srw := newStreamingResponseWriter(w, jw)
+	if err := next.ServeHTTP(srw, r); err != nil {
+		jw.Close()
 		return err
 	}
 
-	// Only attempt to patch JSON responses.
-	if ct := bw.header.Get("Content-Type"); ct != "" && !strings.Contains(strings.ToLower(ct), "json") {
-		return bw.flush()
+	// Complete the streaming decode.
+	if err := jw.Close(); err != nil {
+		log.Debug("n_ctx: /v1/models response is not valid JSON", zap.Error(err))
+		srw.commit()
+		return nil
 	}
 
-	var resp modelsResponse
-	if err := json.UnmarshalRead(bytes.NewReader(bw.buf.Bytes()), &resp); err != nil {
-		log.Debug("n_ctx: /v1/models response is not a JSON object, forwarding unchanged", zap.Error(err))
-		return bw.flush()
-	}
-	if len(resp.Data) == 0 {
-		return bw.flush()
-	}
-
-	nctx, reasoning := patchModels(&resp, m.ModelConfig, m.ModelConfigs)
-	if nctx > 0 {
-		log.Info("injected meta.n_ctx into /v1/models response", zap.Int("models", nctx))
-	}
-	if reasoning > 0 {
-		log.Info("injected reasoning.supported_effort into /v1/models response", zap.Int("models", reasoning))
+	if len(resp.Data) > 0 {
+		nctx, reasoning := patchModels(&resp, m.ModelConfig, m.ModelConfigs)
+		if nctx > 0 {
+			log.Info("injected meta.n_ctx into /v1/models response", zap.Int("models", nctx))
+		}
+		if reasoning > 0 {
+			log.Info("injected reasoning.supported_effort into /v1/models response", zap.Int("models", reasoning))
+		}
 	}
 
-	// Re-serialize the patched response and replace the buffered body.
-	patched, err := json.Marshal(resp)
-	if err != nil {
-		log.Warn("n_ctx: failed to re-serialize /v1/models response, forwarding original", zap.Error(err))
-		return bw.flush()
-	}
-	log.Debug("sending models", zap.Any("data", resp))
-	bw.buf = *bytes.NewBuffer(patched)
-	bw.header.Set("Content-Length", strconv.Itoa(len(patched)))
-	return bw.flush()
+	srw.commit()
+	jr := cjson.NewJsonReader(resp)
+	defer jr.Close()
+	_, err := io.Copy(w, jr)
+	return err
 }
 
 // patchModels enriches every model entry that is missing fields.
