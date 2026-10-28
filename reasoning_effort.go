@@ -229,6 +229,8 @@ func validateHooks(hooks []Hook) error {
 	return nil
 }
 
+const max_allocate_len = 1 << 20 * 10
+
 // ServeHTTP implements caddyhttp.MiddlewareHandler.
 func (m ReasoningEffort) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	log := m.log
@@ -259,6 +261,9 @@ func (m ReasoningEffort) ServeHTTP(w http.ResponseWriter, r *http.Request, next 
 	// Decode into a typed struct. The `inline` tag captures all unknown
 	// fields as a pass-through map, so we avoid type assertions for them.
 	var body RequestBody
+	if r.ContentLength > 0 {
+		body.Inline = make(jsontext.Value, 0, min(r.ContentLength, max_allocate_len))
+	}
 	if err := json.UnmarshalRead(tee, &body); err != nil {
 		io.Copy(io.Discard, tee)
 		log.Warn("skipping transformation: body is not valid request", zap.Error(err))
