@@ -42,6 +42,14 @@ const defaultPath = "/v1/chat/completions"
 // that lacks it, taken from the server's --ctx-size argument.
 const defaultModelsPath = "/v1/models"
 
+// defaultAudioSpeechPath is the OpenAI-compatible text-to-speech request
+// path. Requests arriving here are rewritten into llama.cpp /tts shape.
+const defaultAudioSpeechPath = "/v1/audio/speech"
+
+// defaultTTSPath is the llama.cpp text-to-speech backend path that
+// /v1/audio/speech requests are forwarded to.
+const defaultTTSPath = "/tts"
+
 // defaultHookTimeout is the per-hook client timeout used when a hook does
 // not specify its own timeout.
 const defaultHookTimeout = 5 * time.Second
@@ -76,6 +84,15 @@ type ReasoningEffort struct {
 	// SlotLRUMax is the maximum number of tracked slot save files.
 	// Zero (the default) tracks files without evicting any.
 	SlotLRUMax int `json:"slot_lru_max,omitzero"`
+
+	// AudioSpeechPath is the OpenAI-compatible text-to-speech request
+	// path. Requests arriving here are rewritten into llama.cpp /tts
+	// shape and forwarded to TTSPath. Defaults to "/v1/audio/speech".
+	AudioSpeechPath string `json:"audio_speech_path,omitzero"`
+
+	// TTSPath is the llama.cpp text-to-speech backend path that
+	// AudioSpeechPath requests are forwarded to. Defaults to "/tts".
+	TTSPath string `json:"tts_path,omitzero"`
 
 	ModelConfig
 	ModelConfigs map[string]ModelConfig `json:"model_configs,omitzero"`
@@ -115,6 +132,18 @@ type ModelConfig struct {
 	// key in ReasoningEffort.ModelConfigs, that per-model Hooks array
 	// fully overrides the top-level Hooks (no inheritance).
 	Hooks []Hook `json:"hooks,omitzero"`
+
+	// Voices maps an OpenAI-style voice name to a local speaker reference
+	// audio file. For /v1/audio/speech requests, a request voice that
+	// matches a key is read from the file and sent to the llama.cpp
+	// /tts backend as speaker_ref_b64 (base64). Voices absent from the
+	// map are passed through to the backend without a reference.
+	Voices map[string]string `json:"voices,omitzero"`
+
+	// voiceCache holds the base64 encoding of every Voices file, built
+	// once in Provision so request handling performs no disk I/O. A file
+	// change requires a Caddy reload to take effect.
+	voiceCache map[string]string
 }
 
 // Hook is a single hook configuration. The Type field is a discriminator
@@ -178,6 +207,12 @@ func (m *ReasoningEffort) Provision(ctx caddy.Context) error {
 	if m.ModelsPath == "" {
 		m.ModelsPath = defaultModelsPath
 	}
+	if m.AudioSpeechPath == "" {
+		m.AudioSpeechPath = defaultAudioSpeechPath
+	}
+	if m.TTSPath == "" {
+		m.TTSPath = defaultTTSPath
+	}
 	m.log = ctx.Logger(m)
 
 	if m.hookClient == nil {
@@ -196,6 +231,9 @@ func (m *ReasoningEffort) Provision(ctx caddy.Context) error {
 	log := m.log
 	if log == nil {
 		log = zap.NewNop()
+	}
+	if err := m.provisionVoices(log); err != nil {
+		return err
 	}
 	if err := m.provisionSlotLRU(log); err != nil {
 		return err
@@ -242,6 +280,10 @@ func (m ReasoningEffort) ServeHTTP(w http.ResponseWriter, r *http.Request, next 
 		// Synthesize meta.n_ctx for /v1/models responses of models that lack it.
 		log.Debug("matched models path", zap.String("path", r.URL.Path))
 		return m.serveModels(w, r, next)
+	case m.AudioSpeechPath:
+		// Rewrite the OpenAI /v1/audio/speech request into llama.cpp /tts shape.
+		log.Debug("matched audio-speech path", zap.String("path", r.URL.Path))
+		return m.serveAudioSpeech(w, r, next)
 	case m.Path:
 		log.Debug("matched chat-completions path", zap.String("path", r.URL.Path))
 	default:
@@ -569,6 +611,20 @@ func (m *ReasoningEffort) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.ArgErr()
 				}
 				m.ModelsPath = d.Val()
+			case "audio_speech_path":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				m.AudioSpeechPath = d.Val()
+			case "tts_path":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				m.TTSPath = d.Val()
+			case "voice":
+				if err := parseVoice(d, &m.Voices); err != nil {
+					return err
+				}
 			case "slot_save_path", "slot_lru_max":
 				if err := m.parseSlotOption(d); err != nil {
 					return err
@@ -646,11 +702,28 @@ func (m *ReasoningEffort) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	return nil
 }
 
+// parseVoice parses a `voice <name> <path>` directive into the
+// voice→speaker-reference-file map.
+func parseVoice(d *caddyfile.Dispenser, voices *map[string]string) error {
+	if !d.NextArg() {
+		return d.ArgErr()
+	}
+	name := d.Val()
+	if !d.NextArg() {
+		return d.ArgErr()
+	}
+	if *voices == nil {
+		*voices = map[string]string{}
+	}
+	(*voices)[name] = d.Val()
+	return nil
+}
+
 // parseModelConfigBlock parses a `model <name> { ... }` block into a
 // ModelConfig. The dispenser must be positioned at the model name token,
 // with the block opening brace on the same line. Only `map`,
 // `to_chat_template_key`, `logit_bias`, `reasoning_logit_bias`, `remove`,
-// and `hook` are allowed inside a model block.
+// `voice`, and `hook` are allowed inside a model block.
 func parseModelConfigBlock(d *caddyfile.Dispenser) (ModelConfig, error) {
 	var mc ModelConfig
 	// The dispenser is positioned on the model name token, with the
@@ -712,6 +785,10 @@ func parseModelConfigBlock(d *caddyfile.Dispenser) (ModelConfig, error) {
 			mc.ReasoningLogitBias[level] = bias
 		case "remove":
 			mc.Remove = true
+		case "voice":
+			if err := parseVoice(d, &mc.Voices); err != nil {
+				return mc, err
+			}
 		case "hook":
 			h, err := parseHook(d)
 			if err != nil {

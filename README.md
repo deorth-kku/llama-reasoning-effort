@@ -72,10 +72,13 @@ Or use JSON config:
 | --- | --- | --- |
 | `path` | string | The request path on which the transformation is applied. Defaults to `/v1/chat/completions`. |
 | `models_path` | string | The request path for the llama.cpp `/v1/models` listing. See [/v1/models meta.n_ctx injection](#v1-models-meta_ctx-injection). Defaults to `/v1/models`. |
+| `audio_speech_path` | string | The OpenAI-compatible text-to-speech request path. Requests arriving here are rewritten into llama.cpp `/tts` shape. See [OpenAI-compatible /v1/audio/speech](#openai-compatible-v1audiospeech). Defaults to `/v1/audio/speech`. |
+| `tts_path` | string | The llama.cpp text-to-speech backend path that `audio_speech_path` requests are forwarded to. Defaults to `/tts`. |
 | `map` | string → int | Maps a `reasoning_effort` value to the `thinking_budget_tokens` value. A value of `0` sets `chat_template_kwargs.enable_thinking` to `false` instead. |
 | `to_chat_template_key` | string | If set, the `reasoning_effort` value is also written into `chat_template_kwargs` under this key. |
 | `logit_bias` | string → JSON value | Maps a `reasoning_effort` value to a `logit_bias` value written to the request (replacing any existing `logit_bias`). The value is a raw JSON value — an object of token id → bias, a `[[id, bias]]` array, etc. A bias of `false` means `-Inf`. |
 | `remove` | bool | When set, the `reasoning_effort` field is stripped from the downstream request body. |
+| `voice` | string → string | Maps an OpenAI-style voice name to a local speaker reference audio file, for `/v1/audio/speech` requests. See [OpenAI-compatible /v1/audio/speech](#openai-compatible-v1audiospeech). |
 | `model_configs` | model name → config | Per-model overrides. Each entry supports the same `map`, `to_chat_template_key`, `logit_bias`, `remove`, and `hooks` options as the top level. |
 | `hooks` | hook → config | (Top level) An ordered list of hooks fired for every matching request. See [Hooks](#hooks). |
 | `slot_save_path` | string | Where llama-server's slot save files live: a local directory (llama-server's `--slot-save-path`) or an `smb://` URL pointing at the same directory on an SMB share. Setting it enables the slot file LRU and the `action=delete` handler. See [Slot file LRU and delete](#slot-file-lru-and-delete). |
@@ -141,6 +144,57 @@ OpenRouter-style clients read a `reasoning` block (with `supported_effort`) from
     }
 }
 ```
+
+## OpenAI-compatible /v1/audio/speech
+
+llama-server's text-to-speech endpoint is `POST /tts`, which takes a llama.cpp-specific JSON body and returns raw audio. This plugin exposes the OpenAI-compatible `POST /v1/audio/speech` shape on top of it: requests arriving at the configured `audio_speech_path` (default `/v1/audio/speech`) are rewritten into `/tts` shape and forwarded to the configured `tts_path` (default `/tts`).
+
+Field mapping:
+
+- `input` is forwarded as `input`; `voice` is forwarded as `voice`.
+- `response_format`: `wav` and `pcm` are supported. A missing value defaults to `wav` (OpenAI's default `mp3` cannot be produced by the backend); any other value (`mp3`, `opus`, `aac`, `flac`) is rejected with a `400`.
+- `speed` and any other unrecognized fields are passed through to the backend unchanged.
+
+### Voice → speaker reference mapping
+
+Some TTS models (e.g. LFM2-Audio) take a speaker reference audio to clone a voice, via `speaker_ref_b64` (base64) in the `/tts` body. OpenAI requests only carry a `voice` name, so the plugin maps voice names to local reference files with the `voice` option (top level or per-model, same selection rule as the other options):
+
+```caddyfile
+reasoning_effort {
+    voice alloy /srv/voices/alloy.wav
+    model lfm2-audio {
+        voice female /srv/voices/female.wav
+        voice male /srv/voices/male.wav
+    }
+}
+```
+
+```json
+{
+    "voices": { "alloy": "/srv/voices/alloy.wav" },
+    "model_configs": {
+        "lfm2-audio": {
+            "voices": {
+                "female": "/srv/voices/female.wav",
+                "male": "/srv/voices/male.wav"
+            }
+        }
+    }
+}
+```
+
+- A request `voice` that matches a key is read from the file and sent to the backend as `speaker_ref_b64`.
+- A `voice` absent from the map is passed through to the backend **without** a reference — this covers model-native voices (e.g. `female`/`male` for LFM3-Audio) that need no reference file.
+- Reference files are read **once at startup** and cached as base64 in memory; a file change requires a Caddy reload. A configured file that is missing or unreadable fails startup with an error naming the model and voice.
+
+### PCM conversion
+
+OpenAI's `pcm` format is 16-bit signed integer samples, while llama.cpp's `pcm` is raw float32 little-endian mono. When `response_format` is `pcm`, the plugin:
+
+- sets `stream: true` on the forwarded request (the backend streams pcm only when asked to), and
+- converts the response from float32 to int16 **on the fly**: each chunk the backend writes is converted and sent to the client immediately, so the response streams from the first sample instead of being buffered in full. The `Content-Type` is rewritten from `audio/pcm;rate=…;encoding=float;bits=32` to `audio/pcm;…;encoding=int;bits=16` (the sample rate is preserved).
+
+`wav` responses are streamed through unchanged. Backend error responses (non-200) are passed through unconverted.
 
 ## Hooks
 
