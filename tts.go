@@ -169,6 +169,8 @@ type pcmResponseWriter struct {
 	out []byte
 }
 
+var _ Unwraper = (*pcmResponseWriter)(nil)
+
 func newPcmResponseWriter(w http.ResponseWriter) *pcmResponseWriter {
 	h := make(http.Header, len(w.Header()))
 	for k, vv := range w.Header() {
@@ -189,6 +191,13 @@ func (p *pcmResponseWriter) WriteHeader(code int) {
 	if !p.committed {
 		p.statusCode = code
 	}
+}
+
+func (p *pcmResponseWriter) Unwrap() http.ResponseWriter {
+	if un, ok := p.ResponseWriter.(Unwraper); ok {
+		return un.Unwrap()
+	}
+	return p.ResponseWriter
 }
 
 // Write commits the captured headers on the first call, then converts the
