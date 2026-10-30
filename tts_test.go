@@ -323,7 +323,7 @@ func TestAudioSpeechPcmConversionIoCopy(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", rec.Code)
 	}
-	want := s16LE(3276, -6553, 9830, -13107)
+	want := s16LE(3277, -6554, 9830, -13107)
 	if !bytes.Equal(rec.Body.Bytes(), want) {
 		t.Errorf("expected s16 bytes %x, got %x", want, rec.Body.Bytes())
 	}
@@ -347,6 +347,38 @@ func TestAudioSpeechPcmErrorPassthrough(t *testing.T) {
 	}
 	if !bytes.Equal(rec.Body.Bytes(), errBody) {
 		t.Errorf("expected error body passed through unconverted, got %q", rec.Body.Bytes())
+	}
+}
+
+func TestAudioSpeechPcmHeaderOnlyError(t *testing.T) {
+	m := ReasoningEffort{
+		AudioSpeechPath: defaultAudioSpeechPath,
+		TTSPath:         defaultTTSPath,
+	}
+	rec := runAudioSpeech(t, m, `{"input":"hi","response_format":"pcm"}`, func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		// No body is written: the status and headers must still reach the
+		// client via the early commit on a non-200 WriteHeader.
+	})
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected status 404, got %d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("expected Content-Type application/json, got %q", ct)
+	}
+}
+
+func TestPcmResponseWriterNoHeaderDuplication(t *testing.T) {
+	rec := httptest.NewRecorder()
+	rec.Header().Set("X-Existing", "a")
+	w := newPcmResponseWriter(rec)
+	w.Header().Set("Content-Type", "audio/pcm;rate=24000;encoding=float;bits=32")
+	if _, err := w.Write(f32LE(0.5)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if got := rec.Header().Values("X-Existing"); len(got) != 1 || got[0] != "a" {
+		t.Errorf("expected X-Existing to appear exactly once as %q, got %v", "a", got)
 	}
 }
 

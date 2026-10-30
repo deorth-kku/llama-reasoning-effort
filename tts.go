@@ -172,13 +172,12 @@ type pcmResponseWriter struct {
 var _ Unwraper = (*pcmResponseWriter)(nil)
 
 func newPcmResponseWriter(w http.ResponseWriter) *pcmResponseWriter {
-	h := make(http.Header, len(w.Header()))
-	for k, vv := range w.Header() {
-		h[k] = append([]string(nil), vv...)
-	}
+	// Only capture the headers the upstream sets (via Header); do not
+	// pre-seed from w.Header(), since commit() re-adds every captured
+	// header and pre-seeding would duplicate headers already on w.
 	return &pcmResponseWriter{
 		ResponseWriter: w,
-		header:         h,
+		header:         make(http.Header),
 		statusCode:     http.StatusOK,
 	}
 }
@@ -190,6 +189,13 @@ func (p *pcmResponseWriter) Header() http.Header { return p.header }
 func (p *pcmResponseWriter) WriteHeader(code int) {
 	if !p.committed {
 		p.statusCode = code
+		if code != http.StatusOK {
+			// A non-200 response may have no body, in which case the first
+			// Write (and thus commit) never happens and the status/headers
+			// would be lost. Flush it now so header-only errors reach the
+			// client.
+			p.commit()
+		}
 	}
 }
 
@@ -282,6 +288,6 @@ func s16FromF32(f float32) int16 {
 	case f <= -1:
 		return -32768
 	default:
-		return int16(f * 32768)
+		return int16(math.Round(float64(f) * 32768))
 	}
 }
