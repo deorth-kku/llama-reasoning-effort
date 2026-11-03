@@ -201,6 +201,86 @@ func TestAudioSpeechUnmappedVoicePassesThrough(t *testing.T) {
 	}
 }
 
+func TestAudioSpeechKanjiThenKanaImpliesJapanese(t *testing.T) {
+	m := ReasoningEffort{
+		AudioSpeechPath: defaultAudioSpeechPath,
+		TTSPath:         defaultTTSPath,
+	}
+	cap := runHandler(t, m, `{"input":"漢字とこんにちは。"}`, defaultAudioSpeechPath)
+
+	var got map[string]any
+	if err := json.Unmarshal(cap.body, &got); err != nil {
+		t.Fatalf("downstream body not valid json: %v", err)
+	}
+	if got["lang"] != "ja" {
+		t.Errorf("expected lang ja for kanji-led kana input without lang, got %v", got["lang"])
+	}
+}
+
+func TestAudioSpeechKanaWithoutLeadingKanji(t *testing.T) {
+	m := ReasoningEffort{
+		AudioSpeechPath: defaultAudioSpeechPath,
+		TTSPath:         defaultTTSPath,
+	}
+	cap := runHandler(t, m, `{"input":"こんにちは、テストです。"}`, defaultAudioSpeechPath)
+
+	var got map[string]any
+	if err := json.Unmarshal(cap.body, &got); err != nil {
+		t.Fatalf("downstream body not valid json: %v", err)
+	}
+	if _, ok := got["lang"]; ok {
+		t.Errorf("expected lang absent for kana input without a leading kanji, got %v", got["lang"])
+	}
+}
+
+func TestAudioSpeechKanjiOnlyNoLang(t *testing.T) {
+	m := ReasoningEffort{
+		AudioSpeechPath: defaultAudioSpeechPath,
+		TTSPath:         defaultTTSPath,
+	}
+	cap := runHandler(t, m, `{"input":"汉字测试，没有假名。"}`, defaultAudioSpeechPath)
+
+	var got map[string]any
+	if err := json.Unmarshal(cap.body, &got); err != nil {
+		t.Fatalf("downstream body not valid json: %v", err)
+	}
+	if _, ok := got["lang"]; ok {
+		t.Errorf("expected lang absent for kanji-only input, got %v", got["lang"])
+	}
+}
+
+func TestAudioSpeechKanaWithExplicitLangPreserved(t *testing.T) {
+	m := ReasoningEffort{
+		AudioSpeechPath: defaultAudioSpeechPath,
+		TTSPath:         defaultTTSPath,
+	}
+	cap := runHandler(t, m, `{"input":"こんにちは","lang":"zh"}`, defaultAudioSpeechPath)
+
+	var got map[string]any
+	if err := json.Unmarshal(cap.body, &got); err != nil {
+		t.Fatalf("downstream body not valid json: %v", err)
+	}
+	if got["lang"] != "zh" {
+		t.Errorf("expected explicit lang zh preserved, got %v", got["lang"])
+	}
+}
+
+func TestAudioSpeechNoKanaNoLang(t *testing.T) {
+	m := ReasoningEffort{
+		AudioSpeechPath: defaultAudioSpeechPath,
+		TTSPath:         defaultTTSPath,
+	}
+	cap := runHandler(t, m, `{"input":"Hello, this is a test."}`, defaultAudioSpeechPath)
+
+	var got map[string]any
+	if err := json.Unmarshal(cap.body, &got); err != nil {
+		t.Fatalf("downstream body not valid json: %v", err)
+	}
+	if _, ok := got["lang"]; ok {
+		t.Errorf("expected lang absent for non-kana input, got %v", got["lang"])
+	}
+}
+
 func TestAudioSpeechVoicePerModelConfig(t *testing.T) {
 	topRef := []byte{0x01, 0x02}
 	topPath, _ := writeVoiceFile(t, "ref-top.wav", topRef)

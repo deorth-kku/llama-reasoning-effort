@@ -59,6 +59,7 @@ func (m *ReasoningEffort) provisionVoices(log *zap.Logger) error {
 type ttsRequestBody struct {
 	Model          string         `json:"model,omitzero"`
 	Input          string         `json:"input,omitzero"`
+	Lang           string         `json:"lang,omitzero"`
 	Voice          string         `json:"voice,omitzero"`
 	ResponseFormat string         `json:"response_format,omitzero"`
 	Stream         *bool          `json:"stream,omitzero"`
@@ -121,6 +122,15 @@ func (m ReasoningEffort) serveAudioSpeech(w http.ResponseWriter, r *http.Request
 	if body.ResponseFormat == "pcm" {
 		stream := true
 		body.Stream = &stream
+	}
+
+	// Workaround: without an explicit language the backend can misread
+	// the first kanji of a Japanese utterance as Chinese before it
+	// realizes the text is Japanese. If the input starts with a kanji
+	// and contains kana, and the client did not specify a language,
+	// tell the backend it is Japanese.
+	if body.Lang == "" && startsWithKanji(body.Input) && containsKana(body.Input) {
+		body.Lang = "ja"
 	}
 
 	r.Body = io.NopCloser(cjson.NewJsonReader(body))
@@ -277,6 +287,28 @@ func (p *pcmResponseWriter) commit() {
 	h.Del("Transfer-Encoding")
 	p.ResponseWriter.WriteHeader(p.statusCode)
 	p.committed = true
+}
+
+// startsWithKanji reports whether the first rune of s is a kanji
+// (CJK Unified Ideographs U+4E00..U+9FFF or Extension A
+// U+3400..U+4DBF). An empty string is false.
+func startsWithKanji(s string) bool {
+	for _, r := range s {
+		v := (r >= 0x4E00 && r <= 0x9FFF) || (r >= 0x3400 && r <= 0x4DBF)
+		return v
+	}
+	return false
+}
+
+// containsKana reports whether s contains a hiragana (U+3040..U+309F)
+// or katakana (U+30A0..U+30FF) character.
+func containsKana(s string) bool {
+	for _, r := range s {
+		if (r >= 0x3040 && r <= 0x309F) || (r >= 0x30A0 && r <= 0x30FF) {
+			return true
+		}
+	}
+	return false
 }
 
 // s16FromF32 converts a float32 sample in [-1, 1] to a 16-bit integer,
