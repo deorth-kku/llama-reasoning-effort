@@ -16,6 +16,7 @@ import (
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy"
 	cjson "github.com/deorth-kku/go-common/json"
 	"go.uber.org/zap"
 )
@@ -85,6 +86,21 @@ type ReasoningEffort struct {
 	// Zero (the default) tracks files without evicting any.
 	SlotLRUMax int `json:"slot_lru_max,omitzero"`
 
+	// Upstreams, when non-empty, makes the handler terminating: it
+	// probes each upstream's /v1/models on ProbeInterval and routes
+	// requests to the selected backend instead of calling the next
+	// handler. Order is priority order. See upstream.go for the
+	// selection rules.
+	Upstreams []Upstream `json:"upstreams,omitzero"`
+
+	// ProbeInterval is the interval between /v1/models probes to each
+	// upstream. Defaults to 10s when Upstreams is configured.
+	ProbeInterval caddy.Duration `json:"probe_interval,omitzero"`
+
+	// ProbeTimeout bounds each probe request. Defaults to 5s when
+	// Upstreams is configured.
+	ProbeTimeout caddy.Duration `json:"probe_timeout,omitzero"`
+
 	// AudioSpeechPath is the OpenAI-compatible text-to-speech request
 	// path. Requests arriving here are rewritten into llama.cpp /tts
 	// shape and forwarded to TTSPath. Defaults to "/v1/audio/speech".
@@ -112,6 +128,16 @@ type ReasoningEffort struct {
 	// concrete type so that NFS can be supported in the future; it is
 	// used only to close the filesystem in Cleanup.
 	fsCloser io.Closer
+
+	// probeClient is the HTTP client used for /v1/models probes. It is
+	// created in Provision when Upstreams is configured and has no
+	// global timeout; each probe gets its own context timeout.
+	probeClient *http.Client
+
+	// upstreams is the runtime state of every configured upstream, in
+	// priority order. It is created in Provision when Upstreams is
+	// configured.
+	upstreams []*upstreamState
 
 	log *zap.Logger
 }
@@ -238,6 +264,11 @@ func (m *ReasoningEffort) Provision(ctx caddy.Context) error {
 	if err := m.provisionSlotLRU(log); err != nil {
 		return err
 	}
+	if len(m.Upstreams) > 0 {
+		if err := m.provisionUpstreams(ctx); err != nil {
+			return err
+		}
+	}
 	// Log a copy with any SMB credentials in SlotSavePath redacted.
 	cfg := *m
 	cfg.SlotSavePath = redactSMBURL(m.SlotSavePath)
@@ -267,6 +298,39 @@ func validateHooks(hooks []Hook) error {
 	return nil
 }
 
+// provisionUpstreams validates the upstream configuration, creates one
+// Caddy reverse proxy per upstream and starts the probe loop. The
+// reverse proxies give us Caddy's connection pooling, timeouts and
+// SSE flush handling for free; `text/event-stream` responses are
+// always flushed immediately by the reverse proxy, so no explicit
+// FlushInterval is needed.
+func (m *ReasoningEffort) provisionUpstreams(ctx caddy.Context) error {
+	if m.ProbeInterval <= 0 {
+		m.ProbeInterval = caddy.Duration(defaultProbeInterval)
+	}
+	if m.ProbeTimeout <= 0 {
+		m.ProbeTimeout = caddy.Duration(defaultProbeTimeout)
+	}
+	m.probeClient = &http.Client{}
+	for i, up := range m.Upstreams {
+		if up.Dial == "" {
+			return fmt.Errorf("upstreams[%d]: dial is required", i)
+		}
+		rp := &reverseproxy.Handler{
+			Upstreams: reverseproxy.UpstreamPool{{Dial: up.Dial}},
+		}
+		if err := rp.Provision(ctx); err != nil {
+			return fmt.Errorf("upstreams[%d] (%s): %w", i, up.Dial, err)
+		}
+		// Start optimistic: until the first probe fills the model list,
+		// model-less requests go to upstreams by priority order, but
+		// named-model requests get a 404 (selectUpstream has no data).
+		m.upstreams = append(m.upstreams, &upstreamState{dial: up.Dial, rp: rp, healthy: true})
+	}
+	m.startProber(ctx)
+	return nil
+}
+
 const max_allocate_len = 1 << 20 * 10
 
 // ServeHTTP implements caddyhttp.MiddlewareHandler.
@@ -275,6 +339,10 @@ func (m ReasoningEffort) ServeHTTP(w http.ResponseWriter, r *http.Request, next 
 	if log == nil {
 		log = zap.NewNop()
 	}
+	// In terminating mode (Upstreams configured), `next` is replaced by
+	// the selected upstream's handler before dispatch, so every existing
+	// serve path forwards to the chosen backend unchanged.
+	term := len(m.Upstreams) > 0
 	switch r.URL.Path {
 	case m.ModelsPath:
 		// Synthesize meta.n_ctx for /v1/models responses of models that lack it.
@@ -283,11 +351,30 @@ func (m ReasoningEffort) ServeHTTP(w http.ResponseWriter, r *http.Request, next 
 	case m.AudioSpeechPath:
 		// Rewrite the OpenAI /v1/audio/speech request into llama.cpp /tts shape.
 		log.Debug("matched audio-speech path", zap.String("path", r.URL.Path))
+		if term {
+			// /tts requests are routed to the first usable upstream: the
+			// body's model field is only known after serveAudioSpeech
+			// parses it, and re-reading the body would cost a second
+			// read.
+			next = m.upstreamHandler(m.firstUsableUpstream())
+		}
 		return m.serveAudioSpeech(w, r, next)
 	case m.Path:
 		log.Debug("matched chat-completions path", zap.String("path", r.URL.Path))
 	default:
 		log.Debug("not matching any path", zap.String("path", r.URL.Path))
+		if term {
+			// GET-style endpoints carry the model as a URL argument.
+			if model := r.URL.Query().Get("model"); model != "" {
+				idx, ok := m.selectUpstream(model)
+				if !ok {
+					return writeModelNotFound(w, model)
+				}
+				next = m.upstreamHandler(idx)
+			} else {
+				next = m.upstreamHandler(m.firstUsableUpstream())
+			}
+		}
 		// Try the slot file LRU / delete handler before plain pass-through.
 		if handled, err := m.serveSlots(w, r, next); handled {
 			return err
@@ -310,7 +397,25 @@ func (m ReasoningEffort) ServeHTTP(w http.ResponseWriter, r *http.Request, next 
 		io.Copy(io.Discard, tee)
 		log.Warn("skipping transformation: body is not valid request", zap.Error(err))
 		r.Body = io.NopCloser(&bodyCopy)
+		if term {
+			// The model is unknown when the body is not valid JSON; use
+			// the first usable upstream.
+			next = m.upstreamHandler(m.firstUsableUpstream())
+		}
 		return next.ServeHTTP(w, r)
+	}
+
+	if term {
+		if body.Model != "" {
+			idx, ok := m.selectUpstream(body.Model)
+			if !ok {
+				return writeModelNotFound(w, body.Model)
+			}
+			next = m.upstreamHandler(idx)
+		} else {
+			// No model field: the backend picks its default model.
+			next = m.upstreamHandler(m.firstUsableUpstream())
+		}
 	}
 
 	// Resolve the model config to use, selected by the request's `model`
@@ -621,6 +726,31 @@ func (m *ReasoningEffort) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return d.ArgErr()
 				}
 				m.TTSPath = d.Val()
+			case "upstreams":
+				for d.NextArg() {
+					m.Upstreams = append(m.Upstreams, Upstream{Dial: d.Val()})
+				}
+				if len(m.Upstreams) == 0 {
+					return d.Errf("upstreams requires at least one dial")
+				}
+			case "probe_interval":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				parsed, err := time.ParseDuration(d.Val())
+				if err != nil {
+					return d.Errf("invalid probe_interval value '%s': %v", d.Val(), err)
+				}
+				m.ProbeInterval = caddy.Duration(parsed)
+			case "probe_timeout":
+				if !d.NextArg() {
+					return d.ArgErr()
+				}
+				parsed, err := time.ParseDuration(d.Val())
+				if err != nil {
+					return d.Errf("invalid probe_timeout value '%s': %v", d.Val(), err)
+				}
+				m.ProbeTimeout = caddy.Duration(parsed)
 			case "voice":
 				if err := parseVoice(d, &m.Voices); err != nil {
 					return err

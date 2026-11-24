@@ -83,6 +83,9 @@ Or use JSON config:
 | `hooks` | hook → config | (Top level) An ordered list of hooks fired for every matching request. See [Hooks](#hooks). |
 | `slot_save_path` | string | Where llama-server's slot save files live: a local directory (llama-server's `--slot-save-path`) or an `smb://` URL pointing at the same directory on an SMB share. Setting it enables the slot file LRU and the `action=delete` handler. See [Slot file LRU and delete](#slot-file-lru-and-delete). |
 | `slot_lru_max` | int | Maximum number of tracked slot save files. Zero (default) tracks files without evicting. Requires `slot_save_path`. |
+| `upstreams` | list of `{dial}` | llama.cpp backends to route to, in priority order. When set, the handler becomes terminating (it no longer calls the next handler) and routes requests by model. See [Upstream routing](#upstream-routing-terminating-mode). |
+| `probe_interval` | duration | Interval between `/v1/models` probes to each upstream. Default `10s`. Requires `upstreams`. |
+| `probe_timeout` | duration | Timeout of each probe request. Default `5s`. Requires `upstreams`. |
 
 In the Caddyfile, per-model configs use a `model <name> { ... }` block:
 
@@ -142,6 +145,54 @@ OpenRouter-style clients read a `reasoning` block (with `supported_effort`) from
     "reasoning": {
         "supported_effort": ["high", "low", "medium"]
     }
+}
+```
+
+## Upstream routing (terminating mode)
+
+Setting `upstreams` turns the handler into a terminating model router: instead of calling the next handler (e.g. a `reverse_proxy`), it probes each upstream's `/v1/models` on `probe_interval` and forwards every request to the backend it selects. The request body is still read and transformed exactly once — the body rewrite and the routing decision happen in the same pass.
+
+### Routing rules
+
+- **POST requests** (e.g. `/v1/chat/completions`): the `model` field of the request body selects the backend.
+- **GET-style requests** (no body): the `model` URL argument selects the backend. Requests without a `model` argument go to the first healthy upstream (the first upstream when none is healthy).
+- For a model ID listed by several upstreams, **the loaded one wins**; when none (or both) is loaded, **the earlier position in `upstreams` wins**. The same rule decides which upstream's entry appears in the merged `/v1/models` listing.
+- Selection at request time, in order:
+  1. the first (in priority order) **healthy** upstream that has the model **loaded**;
+  2. the first **healthy** upstream that lists the model (loaded or not — forwarding to an unloaded model triggers llama.cpp to load it);
+  3. the first upstream that lists the model at all (the probe may be stale);
+  4. otherwise a `404` with an OpenAI-style `model_not_found` error.
+- Health is probe-based: an upstream whose probe fails is unhealthy until the next successful probe. There is no request-level retry — a failed request fails, and the client's retry is routed by the (possibly updated) probe state.
+
+### Merged /v1/models
+
+`GET /v1/models` fetches every upstream's listing in parallel (this also refreshes the probe state), merges them per the rule above, applies the same `meta.n_ctx` / `reasoning.supported_effort` enrichment as middleware mode, and returns the merged list. If all fetches fail, the last known probe data is served; if there is none, a `503` with an empty list.
+
+### Notes
+
+- `/v1/audio/speech` → `/tts` requests are routed to the first healthy upstream (the first upstream when none is healthy; the body's `model` field is only known after the rewrite, and re-reading the body would cost a second read).
+- Slot requests (`/slots*`) are routed the same way.
+- Because the handler terminates the chain, the downstream `reverse_proxy` route for the same paths is no longer needed — its `load_balancing` and `health_checks` are superseded by the probes.
+
+```json
+{
+    "handler": "reasoning_effort",
+    "upstreams": [
+        {"dial": "aaa-pc.lan:8080"},
+        {"dial": "qwen.lan:8080"}
+    ],
+    "probe_interval": "10s",
+    "probe_timeout": "5s",
+    "map": {"none": 0, "low": 1024, "medium": 2048, "high": 4096}
+}
+```
+
+```caddyfile
+reasoning_effort {
+    upstreams aaa-pc.lan:8080 qwen.lan:8080
+    probe_interval 10s
+    probe_timeout 5s
+    map low 1024
 }
 ```
 

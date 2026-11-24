@@ -118,12 +118,17 @@ func (s *streamingResponseWriter) commit() {
 	s.ResponseWriter.WriteHeader(s.statusCode)
 }
 
-// serveModels handles the /v1/models listing. It streams the upstream
-// response into a modelsResponse struct via cjson.JsonWriter, enriches every
-// model entry (meta.n_ctx from --ctx-size, reasoning.supported_effort from
-// the config), then streams the patched struct back out via cjson.JsonReader.
-// No large []byte is ever allocated for the full response.
+// serveModels handles the /v1/models listing. In terminating mode (Upstreams
+// configured) it serves the merged listing of all upstreams. In middleware
+// mode it streams the upstream response into a modelsResponse struct via
+// cjson.JsonWriter, enriches every model entry (meta.n_ctx from --ctx-size,
+// reasoning.supported_effort from the config), then streams the patched
+// struct back out via cjson.JsonReader. No large []byte is ever allocated
+// for the full response.
 func (m ReasoningEffort) serveModels(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	if len(m.Upstreams) > 0 {
+		return m.serveMergedModels(w, r)
+	}
 	log := m.log
 	if log == nil {
 		log = zap.NewNop()
