@@ -14,6 +14,7 @@ import (
 	"encoding/json/v2"
 
 	"github.com/caddyserver/caddy/v2"
+	"golang.org/x/exp/collection/set"
 )
 
 // fakeBackend emulates a llama.cpp server: it serves a fixed /v1/models
@@ -97,13 +98,13 @@ func waitModelListed(t *testing.T, base string, wanted []string) modelsResponse 
 			_ = res.Body.Close()
 			var listing modelsResponse
 			if err := json.Unmarshal(body, &listing); err == nil {
-				have := map[string]bool{}
+				have := set.Set[string]{}
 				for _, e := range listing.Data {
-					have[e.ID] = true
+					have.Insert(e.ID)
 				}
 				all := true
 				for _, id := range wanted {
-					if !have[id] {
+					if !have.Contains(id) {
 						all = false
 						break
 					}

@@ -462,6 +462,25 @@ func TestServeModelsNoEffortConfigUnchanged(t *testing.T) {
 	}
 }
 
+// TestServeModelsNoRoutingInMiddlewareMode verifies that the routing
+// field is only present in terminating mode: without Upstreams it is
+// omitted from every model entry.
+func TestServeModelsNoRoutingInMiddlewareMode(t *testing.T) {
+	rec := runModelsResponse(t, ReasoningEffort{Map: newTestMap()}, defaultModelsPath, modelsPatchBody, "application/json")
+
+	var resp struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("body not valid JSON: %v\n%s", err, rec.Body.String())
+	}
+	for _, e := range resp.Data {
+		if _, ok := e["routing"]; ok {
+			t.Fatalf("expected no routing field in middleware mode, entry: %v", e)
+		}
+	}
+}
+
 // TestSupportedEfforts verifies the sorted union of Map and LogitBias keys.
 func TestSupportedEfforts(t *testing.T) {
 	cases := []struct {

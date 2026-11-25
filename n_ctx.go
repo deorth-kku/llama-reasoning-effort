@@ -28,7 +28,12 @@ type modelEntry struct {
 	Status    modelStatus     `json:"status,omitzero"`
 	Meta      *modelMeta      `json:"meta,omitzero"`
 	Reasoning *modelReasoning `json:"reasoning,omitzero"`
-	Inline    jsontext.Value  `json:",embed"`
+	// Routing is the dial address of the upstream this model is
+	// currently routed to. It is only populated in terminating mode
+	// (Upstreams configured); middleware mode leaves it empty so the
+	// field is omitted from the response.
+	Routing string         `json:"routing,omitzero"`
+	Inline  jsontext.Value `json:",embed"`
 }
 
 // modelStatus carries the load status plus the raw server arguments. The

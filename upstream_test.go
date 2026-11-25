@@ -261,3 +261,55 @@ func TestUpstreamProbe(t *testing.T) {
 		t.Fatalf("expected unhealthy state with last known models, got healthy=%v models=%v", healthy2, models2)
 	}
 }
+
+// TestServeMergedModelsRouting verifies that the merged /v1/models
+// response carries a routing field on every entry: the dial address of
+// the upstream that would serve the model, per the selection rules
+// (loaded beats listing, priority order breaks ties).
+func TestServeMergedModelsRouting(t *testing.T) {
+	a := &fakeBackend{modelsJSON: `{"object":"list","data":[
+		{"id":"model-a","status":{"value":"loaded"}},
+		{"id":"model-shared","status":{"value":"loading"}}]}`}
+	b := &fakeBackend{modelsJSON: `{"object":"list","data":[
+		{"id":"model-b","status":{"value":"loaded"}},
+		{"id":"model-shared","status":{"value":"loaded"}}]}`}
+	srvA := httptest.NewServer(a.handler())
+	defer srvA.Close()
+	srvB := httptest.NewServer(b.handler())
+	defer srvB.Close()
+
+	m := ReasoningEffort{
+		upstreams: []*upstreamState{
+			{dial: dialOf(srvA)},
+			{dial: dialOf(srvB)},
+		},
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, defaultModelsPath, nil)
+	if err := m.serveMergedModels(rec, req); err != nil {
+		t.Fatalf("serveMergedModels: %v", err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d (%s)", rec.Code, rec.Body.String())
+	}
+	var resp modelsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("merged body not valid JSON: %v\n%s", err, rec.Body.String())
+	}
+
+	want := map[string]string{
+		"model-a":      dialOf(srvA), // loaded on a
+		"model-b":      dialOf(srvB), // listed only by b
+		"model-shared": dialOf(srvB), // loaded on b despite a listing it first
+	}
+	for _, e := range resp.Data {
+		dial, ok := want[e.ID]
+		if !ok {
+			t.Fatalf("unexpected model %q in merged listing", e.ID)
+		}
+		if e.Routing != dial {
+			t.Errorf("model %q: routing = %q, want %q", e.ID, e.Routing, dial)
+		}
+	}
+}

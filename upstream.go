@@ -29,7 +29,7 @@ const (
 // list the same model ID.
 type Upstream struct {
 	// Dial is the host:port of the backend's HTTP API, e.g.
-	// "aaa-pc.lan:8080".
+	// "example.lan:8080".
 	Dial string `json:"dial"`
 }
 
@@ -298,6 +298,15 @@ func (m ReasoningEffort) serveMergedModels(w http.ResponseWriter, r *http.Reques
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
 		return nil
+	}
+
+	// Annotate each entry with the upstream that would serve it, using
+	// the same selection rules as request routing. Every merged ID is
+	// listed by at least one upstream, so this always resolves.
+	for i := range merged {
+		if idx, ok := m.selectUpstream(merged[i].ID); ok {
+			merged[i].Routing = m.upstreams[idx].dial
+		}
 	}
 
 	resp := modelsResponse{Object: "list", Data: merged}

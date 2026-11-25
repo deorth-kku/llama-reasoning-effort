@@ -7,6 +7,7 @@ require (
 	github.com/deorth-kku/go-common v0.0.0-20261019013507-fe718e4bb113
 	github.com/hirochachacha/go-smb2 v1.1.1-0.20260830081004-7245fbcee17a
 	go.uber.org/zap v1.28.0
+	golang.org/x/exp/collection v0.0.0-20261124000051-d6646c509b6d
 )
 
 require (

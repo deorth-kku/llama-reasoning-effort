@@ -168,6 +168,16 @@ Setting `upstreams` turns the handler into a terminating model router: instead o
 
 `GET /v1/models` fetches every upstream's listing in parallel (this also refreshes the probe state), merges them per the rule above, applies the same `meta.n_ctx` / `reasoning.supported_effort` enrichment as middleware mode, and returns the merged list. If all fetches fail, the last known probe data is served; if there is none, a `503` with an empty list.
 
+Every entry also carries a `routing` field: the `dial` address of the upstream that would serve the model, per the selection rules above. It reflects the current probe state, so it tracks load/unload transitions between probes. The field is only present in terminating mode (when `upstreams` is configured); middleware mode omits it.
+
+```json
+{
+    "id": "model-a",
+    "status": {"value": "loaded"},
+    "routing": "example.lan:8080"
+}
+```
+
 ### Notes
 
 - `/v1/audio/speech` → `/tts` requests are routed to the first healthy upstream (the first upstream when none is healthy; the body's `model` field is only known after the rewrite, and re-reading the body would cost a second read).
@@ -178,8 +188,8 @@ Setting `upstreams` turns the handler into a terminating model router: instead o
 {
     "handler": "reasoning_effort",
     "upstreams": [
-        {"dial": "aaa-pc.lan:8080"},
-        {"dial": "qwen.lan:8080"}
+        {"dial": "example.lan:8080"},
+        {"dial": "backup.lan:8080"}
     ],
     "probe_interval": "10s",
     "probe_timeout": "5s",
@@ -189,7 +199,7 @@ Setting `upstreams` turns the handler into a terminating model router: instead o
 
 ```caddyfile
 reasoning_effort {
-    upstreams aaa-pc.lan:8080 qwen.lan:8080
+    upstreams example.lan:8080 backup.lan:8080
     probe_interval 10s
     probe_timeout 5s
     map low 1024
