@@ -364,8 +364,8 @@ func (m ReasoningEffort) ServeHTTP(w http.ResponseWriter, r *http.Request, next 
 	default:
 		log.Debug("not matching any path", zap.String("path", r.URL.Path))
 		if term {
-			// GET-style endpoints carry the model as a URL argument.
-			if model := r.URL.Query().Get("model"); model != "" {
+			model := modelFromRequest(r)
+			if model != "" {
 				idx, ok := m.selectUpstream(model)
 				if !ok {
 					return writeModelNotFound(w, model)

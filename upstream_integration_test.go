@@ -25,6 +25,7 @@ type fakeBackend struct {
 
 	mu       sync.Mutex
 	chatReqs int
+	loadReqs []string
 }
 
 func (b *fakeBackend) handler() http.Handler {
@@ -33,6 +34,13 @@ func (b *fakeBackend) handler() http.Handler {
 		case r.URL.Path == "/v1/models" && r.Method == http.MethodGet:
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(b.modelsJSON))
+		case r.URL.Path == "/models/load" && r.Method == http.MethodPost:
+			body, _ := io.ReadAll(r.Body)
+			b.mu.Lock()
+			b.loadReqs = append(b.loadReqs, string(body))
+			b.mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[]}`))
 		case r.URL.Path == "/v1/chat/completions" && r.Method == http.MethodPost:
 			_, _ = io.ReadAll(r.Body)
 			b.mu.Lock()
@@ -56,6 +64,12 @@ func (b *fakeBackend) chatReqsCount() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.chatReqs
+}
+
+func (b *fakeBackend) loadReqsCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.loadReqs)
 }
 
 func dialOf(srv *httptest.Server) string {
@@ -208,6 +222,25 @@ func TestUpstreamRoutingIntegration(t *testing.T) {
 	_ = res.Body.Close()
 	if got := b.chatReqsCount(); got != 2 {
 		t.Fatalf("expected model-b to route to upstream b, got b=%d", got)
+	}
+
+	// llama.cpp's /models/load carries the model in the JSON body, not
+	// in the URL query: model-b must reach upstream b.
+	res, err := http.Post(base+"/models/load", "application/json",
+		strings.NewReader(`{"model":"model-b"}`))
+	if err != nil {
+		t.Fatalf("POST /models/load: %v", err)
+	}
+	_, _ = io.ReadAll(res.Body)
+	_ = res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		t.Fatalf("/models/load: expected 200, got %d", res.StatusCode)
+	}
+	if got := b.loadReqsCount(); got != 1 {
+		t.Fatalf("expected /models/load to route to upstream b, got b=%d a=%d", b.loadReqsCount(), a.loadReqsCount())
+	}
+	if got := a.loadReqsCount(); got != 0 {
+		t.Fatalf("expected no /models/load on upstream a, got %d", got)
 	}
 
 	// An unknown model gets a 404 and hits neither upstream.

@@ -1,6 +1,7 @@
 package reasoningeffort
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -223,6 +224,85 @@ func TestWriteModelNotFound(t *testing.T) {
 	if !strings.Contains(body.Error.Message, "model-x") {
 		t.Fatalf("expected message to name the model, got %q", body.Error.Message)
 	}
+}
+
+func TestModelFromRequest(t *testing.T) {
+	body := `{"model":"model-b"}`
+	tests := []struct {
+		method string
+		url    string
+		body   string
+		want   string
+	}{
+		{method: http.MethodGet, url: "/models/load?model=model-a", want: "model-a"},
+		{method: http.MethodHead, url: "/models/unload?model=model-a", want: "model-a"},
+		{method: http.MethodDelete, url: "/models/unload?model=model-a", want: "model-a"},
+		{method: http.MethodPost, url: "/models/load", body: body, want: "model-b"},
+		{method: http.MethodPut, url: "/models/load", body: body, want: "model-b"},
+		{method: http.MethodPatch, url: "/models/load", body: body, want: "model-b"},
+		// Unknown methods are treated as body-less.
+		{method: "SEARCH", url: "/models/load?model=model-a", want: "model-a"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.method, func(t *testing.T) {
+			var r *http.Request
+			if tc.body != "" {
+				r = httptest.NewRequest(tc.method, tc.url, strings.NewReader(tc.body))
+			} else {
+				r = httptest.NewRequest(tc.method, tc.url, nil)
+			}
+			if got := modelFromRequest(r); got != tc.want {
+				t.Fatalf("modelFromRequest = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestModelFromBody(t *testing.T) {
+	t.Run("model in JSON body", func(t *testing.T) {
+		body := `{"model":"model-b"}`
+		r := httptest.NewRequest(http.MethodPost, "/models/load", strings.NewReader(body))
+		if got := modelFromBody(r); got != "model-b" {
+			t.Fatalf("modelFromBody = %q, want %q", got, "model-b")
+		}
+		// The body must be restored for the downstream handler.
+		got, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("reading restored body: %v", err)
+		}
+		if string(got) != body {
+			t.Fatalf("restored body = %q, want %q", got, body)
+		}
+	})
+
+	t.Run("JSON without model field", func(t *testing.T) {
+		r := httptest.NewRequest(http.MethodPost, "/models/load", strings.NewReader(`{"foo":1}`))
+		if got := modelFromBody(r); got != "" {
+			t.Fatalf("modelFromBody = %q, want empty", got)
+		}
+	})
+
+	t.Run("invalid JSON keeps body", func(t *testing.T) {
+		body := `not-json`
+		r := httptest.NewRequest(http.MethodPost, "/models/load", strings.NewReader(body))
+		if got := modelFromBody(r); got != "" {
+			t.Fatalf("modelFromBody = %q, want empty", got)
+		}
+		got, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("reading restored body: %v", err)
+		}
+		if string(got) != body {
+			t.Fatalf("restored body = %q, want %q", got, body)
+		}
+	})
+
+	t.Run("empty body", func(t *testing.T) {
+		r := httptest.NewRequest(http.MethodPost, "/models/load", nil)
+		if got := modelFromBody(r); got != "" {
+			t.Fatalf("modelFromBody = %q, want empty", got)
+		}
+	})
 }
 
 func TestUpstreamProbe(t *testing.T) {

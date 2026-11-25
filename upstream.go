@@ -1,6 +1,7 @@
 package reasoningeffort
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -317,6 +318,42 @@ func (m ReasoningEffort) serveMergedModels(w http.ResponseWriter, r *http.Reques
 	defer jr.Close()
 	_, err := io.Copy(w, jr)
 	return err
+}
+
+// modelFromRequest extracts the model identifier from a request, by
+// HTTP method: methods that carry a body (POST, PUT, PATCH) have it in
+// the JSON body's "model" field; methods without a body (GET, HEAD,
+// DELETE) have it as a URL argument. Unknown methods are treated as
+// body-less.
+func modelFromRequest(r *http.Request) string {
+	switch r.Method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch:
+		return modelFromBody(r)
+	case http.MethodGet, http.MethodHead, http.MethodDelete:
+		return r.URL.Query().Get("model")
+	default:
+		return r.URL.Query().Get("model")
+	}
+}
+
+// modelFromBody extracts the "model" field from a JSON request body,
+// restoring the body for the downstream handler. It returns "" when the
+// body has no model field or is not valid JSON.
+func modelFromBody(r *http.Request) string {
+	if r.ContentLength <= 0 {
+		return ""
+	}
+	bodyCopy := bytes.Buffer{}
+	tee := io.TeeReader(r.Body, &bodyCopy)
+	var req struct {
+		Model string `json:"model,omitzero"`
+	}
+	if json.UnmarshalRead(tee, &req) != nil {
+		r.Body = io.NopCloser(&bodyCopy)
+		return ""
+	}
+	r.Body = io.NopCloser(&bodyCopy)
+	return req.Model
 }
 
 // writeModelNotFound answers with an OpenAI-style 404 for a model that
