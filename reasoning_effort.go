@@ -77,9 +77,12 @@ type ReasoningEffort struct {
 	// either a local directory (llama-server's --slot-save-path) or an
 	// smb:// URL of the form
 	// smb://[[[domain;]username[:password]@]server[:port]/share[/path]]
-	// pointing at the same directory on an SMB share. Setting it enables
-	// the slot file LRU (for save/restore tracking and eviction) and the
-	// action=delete handler.
+	// pointing at the same directory on an SMB share, or an nfs:// URL
+	// pointing at it on an NFSv4 export. Setting it enables the slot
+	// file LRU (for save/restore tracking and eviction) and the
+	// action=delete handler. In terminating mode (Upstreams configured)
+	// it is additionally the fallback for upstreams that configure no
+	// slot settings of their own.
 	SlotSavePath string `json:"slot_save_path,omitzero"`
 
 	// SlotLRUMax is the maximum number of tracked slot save files.
@@ -119,15 +122,19 @@ type ReasoningEffort struct {
 	// timeouts without racing on the shared client.
 	hookClient *http.Client
 
-	// slotLRU is the slot save file LRU, created in Provision when
-	// SlotSavePath is set. Nil when the slot features are disabled.
+	// slotLRU is the slot save file LRU for the handler-level slot
+	// settings, created in Provision when SlotSavePath is set. It
+	// serves slot requests in middleware mode, and in terminating mode
+	// it is additionally shared by every upstream that has no slot
+	// settings of its own. Nil when the slot features are disabled.
 	slotLRU *slotLRU
 
-	// fsCloser is the underlying slot filesystem, set in Provision when
-	// SlotSavePath is an smb:// URL. It is an io.Closer rather than a
-	// concrete type so that NFS can be supported in the future; it is
-	// used only to close the filesystem in Cleanup.
-	fsCloser io.Closer
+	// fsClosers are the underlying slot filesystems created in
+	// Provision for smb:// or nfs:// slot_save_path values (one per
+	// distinct remote slot directory). Each is an io.Closer rather
+	// than a concrete type so that NFS can be supported; they are
+	// used only to close the filesystems in Cleanup.
+	fsClosers []io.Closer
 
 	// probeClient is the HTTP client used for /v1/models probes. It is
 	// created in Provision when Upstreams is configured and has no
@@ -265,13 +272,17 @@ func (m *ReasoningEffort) Provision(ctx caddy.Context) error {
 		return err
 	}
 	if len(m.Upstreams) > 0 {
-		if err := m.provisionUpstreams(ctx); err != nil {
+		if err := m.provisionUpstreams(ctx, log); err != nil {
 			return err
 		}
 	}
-	// Log a copy with any SMB credentials in SlotSavePath redacted.
+	// Log a copy with any SMB credentials in the slot_save_path values
+	// redacted.
 	cfg := *m
 	cfg.SlotSavePath = redactSMBURL(m.SlotSavePath)
+	for i := range cfg.Upstreams {
+		cfg.Upstreams[i].SlotSavePath = redactSMBURL(cfg.Upstreams[i].SlotSavePath)
+	}
 	log.Debug("config", zap.Any("config", cfg))
 	return nil
 }
@@ -304,7 +315,7 @@ func validateHooks(hooks []Hook) error {
 // SSE flush handling for free; `text/event-stream` responses are
 // always flushed immediately by the reverse proxy, so no explicit
 // FlushInterval is needed.
-func (m *ReasoningEffort) provisionUpstreams(ctx caddy.Context) error {
+func (m *ReasoningEffort) provisionUpstreams(ctx caddy.Context, log *zap.Logger) error {
 	if m.ProbeInterval <= 0 {
 		m.ProbeInterval = caddy.Duration(defaultProbeInterval)
 	}
@@ -312,9 +323,16 @@ func (m *ReasoningEffort) provisionUpstreams(ctx caddy.Context) error {
 		m.ProbeTimeout = caddy.Duration(defaultProbeTimeout)
 	}
 	m.probeClient = &http.Client{}
+	// lruByConfig deduplicates LRU instances: upstreams that resolve to
+	// the same (path, max) settings share one instance, since they
+	// point at the same directory and the same on-disk state file.
+	lruByConfig := map[string]*slotLRU{}
 	for i, up := range m.Upstreams {
 		if up.Dial == "" {
 			return fmt.Errorf("upstreams[%d]: dial is required", i)
+		}
+		if err := validateUpstreamSlotOptions(i, up); err != nil {
+			return err
 		}
 		rp := &reverseproxy.Handler{
 			Upstreams: reverseproxy.UpstreamPool{{Dial: up.Dial}},
@@ -322,13 +340,67 @@ func (m *ReasoningEffort) provisionUpstreams(ctx caddy.Context) error {
 		if err := rp.Provision(ctx); err != nil {
 			return fmt.Errorf("upstreams[%d] (%s): %w", i, up.Dial, err)
 		}
+		lru, err := m.resolveUpstreamSlotLRU(i, up, log, lruByConfig)
+		if err != nil {
+			return err
+		}
 		// Start optimistic: until the first probe fills the model list,
 		// model-less requests go to upstreams by priority order, but
 		// named-model requests get a 404 (selectUpstream has no data).
-		m.upstreams = append(m.upstreams, &upstreamState{dial: up.Dial, rp: rp, healthy: true})
+		m.upstreams = append(m.upstreams, &upstreamState{dial: up.Dial, rp: rp, healthy: true, slotLRU: lru})
 	}
 	m.startProber(ctx)
 	return nil
+}
+
+// validateUpstreamSlotOptions validates the per-upstream slot options.
+// An upstream's slot_lru_max only makes sense together with its own
+// slot_save_path: the handler-level settings are the unit of fallback,
+// not individual fields.
+func validateUpstreamSlotOptions(i int, up Upstream) error {
+	if up.SlotLRUMax < 0 {
+		return fmt.Errorf("upstreams[%d]: slot_lru_max must be >= 0, got %d", i, up.SlotLRUMax)
+	}
+	if up.SlotSavePath == "" && up.SlotLRUMax != 0 {
+		return fmt.Errorf("upstreams[%d]: slot_lru_max is set but slot_save_path is not", i)
+	}
+	return nil
+}
+
+// resolveUpstreamSlotLRU returns the slot LRU that serves upstream up's
+// /slots requests: the upstream's own LRU when it configures a
+// slot_save_path, the handler-level LRU otherwise. Instances are
+// deduplicated in lruByConfig so upstreams that resolve to the same
+// (path, max) settings share one instance — they point at the same
+// directory and the same on-disk state file.
+func (m *ReasoningEffort) resolveUpstreamSlotLRU(i int, up Upstream, log *zap.Logger, lruByConfig map[string]*slotLRU) (*slotLRU, error) {
+	path, max := m.SlotSavePath, m.SlotLRUMax
+	if up.SlotSavePath != "" {
+		path, max = up.SlotSavePath, up.SlotLRUMax
+	}
+	if path == "" {
+		return nil, nil
+	}
+	key := path + "\x00" + strconv.Itoa(max)
+	if lru := lruByConfig[key]; lru != nil {
+		return lru, nil
+	}
+	if path == m.SlotSavePath && max == m.SlotLRUMax {
+		// The handler-level settings: reuse the shared instance created
+		// in provisionSlotLRU.
+		lruByConfig[key] = m.slotLRU
+		return m.slotLRU, nil
+	}
+	fs, closer, err := newSlotFS(path, log)
+	if err != nil {
+		return nil, fmt.Errorf("upstreams[%d] (%s): %w", i, up.Dial, err)
+	}
+	if closer != nil {
+		m.fsClosers = append(m.fsClosers, closer)
+	}
+	lru := newSlotLRU(fs, max, log)
+	lruByConfig[key] = lru
+	return lru, nil
 }
 
 const max_allocate_len = 1 << 20 * 10
@@ -363,20 +435,27 @@ func (m ReasoningEffort) ServeHTTP(w http.ResponseWriter, r *http.Request, next 
 		log.Debug("matched chat-completions path", zap.String("path", r.URL.Path))
 	default:
 		log.Debug("not matching any path", zap.String("path", r.URL.Path))
+		lru := m.slotLRU
 		if term {
-			model := modelFromRequest(r)
-			if model != "" {
-				idx, ok := m.selectUpstream(model)
+			idx := m.firstUsableUpstream()
+			if model := modelFromRequest(r); model != "" {
+				i, ok := m.selectUpstream(model)
 				if !ok {
 					return writeModelNotFound(w, model)
 				}
-				next = m.upstreamHandler(idx)
-			} else {
-				next = m.upstreamHandler(m.firstUsableUpstream())
+				idx = i
+			}
+			next = m.upstreamHandler(idx)
+			// Slot requests are forwarded to the upstream selected
+			// above, so they are served from that upstream's slot
+			// directory (the handler-level LRU applies when the
+			// upstream has no slot settings of its own).
+			if u := m.upstreams[idx].slotLRU; u != nil {
+				lru = u
 			}
 		}
 		// Try the slot file LRU / delete handler before plain pass-through.
-		if handled, err := m.serveSlots(w, r, next); handled {
+		if handled, err := m.serveSlots(w, r, next, lru); handled {
 			return err
 		}
 		// Only transform requests targeting the configured path.
@@ -727,11 +806,47 @@ func (m *ReasoningEffort) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				m.TTSPath = d.Val()
 			case "upstreams":
-				for d.NextArg() {
+				if d.NextArg() {
+					// Flat form: upstreams dial1 dial2 ...
 					m.Upstreams = append(m.Upstreams, Upstream{Dial: d.Val()})
-				}
-				if len(m.Upstreams) == 0 {
-					return d.Errf("upstreams requires at least one dial")
+					for d.NextArg() {
+						m.Upstreams = append(m.Upstreams, Upstream{Dial: d.Val()})
+					}
+				} else {
+					// Block form:
+					//   upstreams {
+					//       dial1 {
+					//           slot_save_path <path>
+					//           slot_lru_max <n>
+					//       }
+					//       dial2
+					//   }
+					level := d.Nesting()
+					if !d.NextBlock(level) {
+						return d.Errf("upstreams requires at least one dial")
+					}
+					for {
+						up := Upstream{Dial: d.Val()}
+						if d.NextBlock(level + 1) {
+							for {
+								switch d.Val() {
+								case "slot_save_path", "slot_lru_max":
+									if err := parseSlotOption(d, &up.SlotSavePath, &up.SlotLRUMax); err != nil {
+										return err
+									}
+								default:
+									return d.Errf("unexpected token '%s' in upstream", d.Val())
+								}
+								if !d.NextBlock(level + 1) {
+									break
+								}
+							}
+						}
+						m.Upstreams = append(m.Upstreams, up)
+						if !d.NextBlock(level) {
+							break
+						}
+					}
 				}
 			case "probe_interval":
 				if !d.NextArg() {
@@ -756,7 +871,7 @@ func (m *ReasoningEffort) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 					return err
 				}
 			case "slot_save_path", "slot_lru_max":
-				if err := m.parseSlotOption(d); err != nil {
+				if err := parseSlotOption(d, &m.SlotSavePath, &m.SlotLRUMax); err != nil {
 					return err
 				}
 			case "map":

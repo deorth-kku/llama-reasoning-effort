@@ -753,6 +753,75 @@ func TestServeSlotsDisabledPassesThrough(t *testing.T) {
 	}
 }
 
+// TestServeSlotsTerminatingModeUpstreamLRU verifies that in terminating
+// mode, slot requests are served from the LRU of the upstream they are
+// routed to — not from the handler-level LRU.
+func TestServeSlotsTerminatingModeUpstreamLRU(t *testing.T) {
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	dirGlobal := t.TempDir()
+	// a.bin only exists in upstream a's directory.
+	if err := os.WriteFile(filepath.Join(dirA, "a.bin"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	m := ReasoningEffort{Path: defaultPath}
+	m.Upstreams = []Upstream{{Dial: "a"}, {Dial: "b"}}
+	m.slotLRU = newSlotLRU(newLocalFS(dirGlobal), 5, zap.NewNop())
+	m.upstreams = []*upstreamState{
+		{dial: "a", healthy: true, slotLRU: newSlotLRU(newLocalFS(dirA), 5, zap.NewNop())},
+		{dial: "b", healthy: true, slotLRU: newSlotLRU(newLocalFS(dirB), 5, zap.NewNop())},
+	}
+
+	rec, cap := runSlotRequest(t, m, `{"filename":"a.bin"}`, "/slots/0?action=delete")
+	if cap.path != "" || cap.body != nil {
+		t.Fatalf("delete was forwarded downstream: path=%q body=%q", cap.path, cap.body)
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("response code: got %d, want 200", rec.Code)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("response not json: %v", err)
+	}
+	// deleted=true proves the request was served from upstream a's LRU:
+	// a.bin only exists in dirA, neither in the handler-level directory
+	// nor in upstream b's.
+	if resp["deleted"] != true {
+		t.Errorf("expected deleted=true from upstream a's LRU, got %v", resp["deleted"])
+	}
+	if _, err := os.Stat(filepath.Join(dirA, "a.bin")); !os.IsNotExist(err) {
+		t.Errorf("a.bin still exists in upstream a's directory")
+	}
+}
+
+// TestServeSlotsTerminatingModeGlobalFallback verifies that in
+// terminating mode, an upstream without its own slot settings is served
+// by the handler-level LRU.
+func TestServeSlotsTerminatingModeGlobalFallback(t *testing.T) {
+	dirGlobal := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dirGlobal, "a.bin"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	m := ReasoningEffort{Path: defaultPath}
+	m.Upstreams = []Upstream{{Dial: "a"}}
+	m.slotLRU = newSlotLRU(newLocalFS(dirGlobal), 5, zap.NewNop())
+	m.upstreams = []*upstreamState{{dial: "a", healthy: true}} // no slotLRU
+
+	rec, _ := runSlotRequest(t, m, `{"filename":"a.bin"}`, "/slots/0?action=delete")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("response code: got %d, want 200", rec.Code)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("response not json: %v", err)
+	}
+	if resp["deleted"] != true {
+		t.Errorf("expected deleted=true via the handler-level LRU, got %v", resp["deleted"])
+	}
+}
+
 func TestUnmarshalCaddyfileSlotOptions(t *testing.T) {
 	input := `reasoning_effort {
 		slot_save_path /tmp/slots

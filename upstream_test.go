@@ -10,6 +10,7 @@ import (
 
 	"encoding/json/v2"
 
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"go.uber.org/zap"
 )
 
@@ -391,5 +392,156 @@ func TestServeMergedModelsRouting(t *testing.T) {
 		if e.Routing != dial {
 			t.Errorf("model %q: routing = %q, want %q", e.ID, e.Routing, dial)
 		}
+	}
+}
+func TestUnmarshalCaddyfileUpstreamsFlat(t *testing.T) {
+	input := `reasoning_effort {
+		upstreams example.lan:8080 backup.lan:8080
+	}`
+	d := caddyfile.NewTestDispenser(input)
+	var m ReasoningEffort
+	if err := m.UnmarshalCaddyfile(d); err != nil {
+		t.Fatalf("UnmarshalCaddyfile error: %v", err)
+	}
+	if len(m.Upstreams) != 2 {
+		t.Fatalf("expected 2 upstreams, got %d", len(m.Upstreams))
+	}
+	if m.Upstreams[0].Dial != "example.lan:8080" || m.Upstreams[1].Dial != "backup.lan:8080" {
+		t.Errorf("unexpected dials: %q, %q", m.Upstreams[0].Dial, m.Upstreams[1].Dial)
+	}
+}
+
+func TestUnmarshalCaddyfileUpstreamsBlock(t *testing.T) {
+	input := `reasoning_effort {
+		upstreams {
+			example.lan:8080 {
+				slot_save_path /var/lib/llama/slots-a
+				slot_lru_max 16
+			}
+			backup.lan:8080
+		}
+	}`
+	d := caddyfile.NewTestDispenser(input)
+	var m ReasoningEffort
+	if err := m.UnmarshalCaddyfile(d); err != nil {
+		t.Fatalf("UnmarshalCaddyfile error: %v", err)
+	}
+	if len(m.Upstreams) != 2 {
+		t.Fatalf("expected 2 upstreams, got %d", len(m.Upstreams))
+	}
+	up := m.Upstreams[0]
+	if up.Dial != "example.lan:8080" {
+		t.Errorf("dial: got %q", up.Dial)
+	}
+	if up.SlotSavePath != "/var/lib/llama/slots-a" {
+		t.Errorf("slot_save_path: got %q", up.SlotSavePath)
+	}
+	if up.SlotLRUMax != 16 {
+		t.Errorf("slot_lru_max: got %d", up.SlotLRUMax)
+	}
+	if m.Upstreams[1].Dial != "backup.lan:8080" || m.Upstreams[1].SlotSavePath != "" || m.Upstreams[1].SlotLRUMax != 0 {
+		t.Errorf("unexpected second upstream: %+v", m.Upstreams[1])
+	}
+}
+
+func TestUnmarshalCaddyfileUpstreamsBlockUnexpectedToken(t *testing.T) {
+	input := `reasoning_effort {
+		upstreams {
+			example.lan:8080 {
+				probe_interval 10s
+			}
+		}
+	}`
+	d := caddyfile.NewTestDispenser(input)
+	var m ReasoningEffort
+	if err := m.UnmarshalCaddyfile(d); err == nil {
+		t.Fatal("expected error for unexpected token in upstream block, got nil")
+	}
+}
+
+func TestUnmarshalCaddyfileUpstreamsBlockInvalidLRUMax(t *testing.T) {
+	input := `reasoning_effort {
+		upstreams {
+			example.lan:8080 {
+				slot_lru_max abc
+			}
+		}
+	}`
+	d := caddyfile.NewTestDispenser(input)
+	var m ReasoningEffort
+	if err := m.UnmarshalCaddyfile(d); err == nil {
+		t.Fatal("expected error for non-integer slot_lru_max, got nil")
+	}
+}
+
+func TestValidateUpstreamSlotOptions(t *testing.T) {
+	if err := validateUpstreamSlotOptions(0, Upstream{SlotLRUMax: 3}); err == nil {
+		t.Error("expected error for slot_lru_max without slot_save_path")
+	}
+	if err := validateUpstreamSlotOptions(0, Upstream{SlotLRUMax: -1}); err == nil {
+		t.Error("expected error for negative slot_lru_max")
+	}
+	if err := validateUpstreamSlotOptions(0, Upstream{SlotSavePath: "/tmp/slots", SlotLRUMax: 0}); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if err := validateUpstreamSlotOptions(0, Upstream{}); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestResolveUpstreamSlotLRU(t *testing.T) {
+	globalDir := t.TempDir()
+	sharedDir := t.TempDir()
+	m := ReasoningEffort{SlotSavePath: globalDir, SlotLRUMax: 4}
+	if err := m.provisionSlotLRU(zap.NewNop()); err != nil {
+		t.Fatalf("provisionSlotLRU error: %v", err)
+	}
+	lruByConfig := map[string]*slotLRU{}
+	log := zap.NewNop()
+
+	// No slot settings at all: no LRU.
+	var bare ReasoningEffort
+	lru, err := bare.resolveUpstreamSlotLRU(0, Upstream{Dial: "x"}, log, map[string]*slotLRU{})
+	if err != nil || lru != nil {
+		t.Fatalf("no settings: got lru=%v err=%v, want nil", lru, err)
+	}
+
+	// An upstream without its own settings falls back to the
+	// handler-level LRU instance.
+	lru, err = m.resolveUpstreamSlotLRU(0, Upstream{Dial: "a"}, log, lruByConfig)
+	if err != nil {
+		t.Fatalf("fallback: %v", err)
+	}
+	if lru != m.slotLRU {
+		t.Error("expected the handler-level LRU instance to be reused")
+	}
+
+	// A second upstream falling back shares the same instance.
+	lru2, err := m.resolveUpstreamSlotLRU(1, Upstream{Dial: "b"}, log, lruByConfig)
+	if err != nil || lru2 != m.slotLRU {
+		t.Fatalf("second fallback: got %v, %v; want the shared handler-level instance", lru2, err)
+	}
+
+	// An upstream with its own settings gets a dedicated instance.
+	up := Upstream{Dial: "c", SlotSavePath: sharedDir, SlotLRUMax: 2}
+	lru3, err := m.resolveUpstreamSlotLRU(2, up, log, lruByConfig)
+	if err != nil {
+		t.Fatalf("custom path: %v", err)
+	}
+	if lru3 == nil || lru3 == m.slotLRU {
+		t.Fatal("expected a dedicated LRU instance for the upstream's own path")
+	}
+
+	// A second upstream with the same settings shares that instance.
+	lru4, err := m.resolveUpstreamSlotLRU(3, up, log, lruByConfig)
+	if err != nil || lru4 != lru3 {
+		t.Fatalf("dedup: got %v, %v; want the same instance", lru4, err)
+	}
+
+	// The same path with a different limit gets its own instance.
+	up2 := Upstream{Dial: "d", SlotSavePath: sharedDir, SlotLRUMax: 3}
+	lru5, err := m.resolveUpstreamSlotLRU(4, up2, log, lruByConfig)
+	if err != nil || lru5 == lru3 {
+		t.Fatalf("different max: got %v, %v; want a distinct instance", lru5, err)
 	}
 }

@@ -32,14 +32,34 @@ type Upstream struct {
 	// Dial is the host:port of the backend's HTTP API, e.g.
 	// "example.lan:8080".
 	Dial string `json:"dial"`
+
+	// SlotSavePath is where this backend's llama-server slot save files
+	// live (same forms as ReasoningEffort.SlotSavePath). When set, it —
+	// together with SlotLRUMax — overrides the handler-level
+	// slot_save_path/slot_lru_max for this upstream; when unset, the
+	// handler-level slot settings apply to it.
+	SlotSavePath string `json:"slot_save_path,omitzero"`
+
+	// SlotLRUMax is the maximum number of tracked slot save files for
+	// this upstream's slot directory. It is only used when SlotSavePath
+	// is set; zero (the default) tracks files without evicting any.
+	SlotLRUMax int `json:"slot_lru_max,omitzero"`
 }
 
 // upstreamState is the runtime state of one configured upstream: the
-// Caddy reverse proxy used to forward requests to it, plus the latest
-// probe results.
+// Caddy reverse proxy used to forward requests to it, the slot LRU that
+// serves its /slots requests, plus the latest probe results.
 type upstreamState struct {
 	dial string
 	rp   *reverseproxy.Handler
+
+	// slotLRU is the slot file LRU for this upstream's slot directory.
+	// It may be shared: upstreams that resolve to the same settings
+	// (e.g. falling back to the handler-level settings) share one
+	// instance, since they point at the same directory and the same
+	// on-disk state file. Nil when no slot settings apply to this
+	// upstream.
+	slotLRU *slotLRU
 
 	mu      sync.RWMutex
 	healthy bool

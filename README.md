@@ -81,9 +81,9 @@ Or use JSON config:
 | `voice` | string → string | Maps an OpenAI-style voice name to a local speaker reference audio file, for `/v1/audio/speech` requests. See [OpenAI-compatible /v1/audio/speech](#openai-compatible-v1audiospeech). |
 | `model_configs` | model name → config | Per-model overrides. Each entry supports the same `map`, `to_chat_template_key`, `logit_bias`, `remove`, and `hooks` options as the top level. |
 | `hooks` | hook → config | (Top level) An ordered list of hooks fired for every matching request. See [Hooks](#hooks). |
-| `slot_save_path` | string | Where llama-server's slot save files live: a local directory (llama-server's `--slot-save-path`), an `smb://` URL pointing at the same directory on an SMB share, or an `nfs://` URL pointing at it on an NFSv4 export. Setting it enables the slot file LRU and the `action=delete` handler. See [Slot file LRU and delete](#slot-file-lru-and-delete). |
+| `slot_save_path` | string | Where llama-server's slot save files live: a local directory (llama-server's `--slot-save-path`), an `smb://` URL pointing at the same directory on an SMB share, or an `nfs://` URL pointing at it on an NFSv4 export. Setting it enables the slot file LRU and the `action=delete` handler. In terminating mode it is the fallback for upstreams that configure no slot settings of their own. See [Slot file LRU and delete](#slot-file-lru-and-delete). |
 | `slot_lru_max` | int | Maximum number of tracked slot save files. Zero (default) tracks files without evicting. Requires `slot_save_path`. |
-| `upstreams` | list of `{dial}` | llama.cpp backends to route to, in priority order. When set, the handler becomes terminating (it no longer calls the next handler) and routes requests by model. See [Upstream routing](#upstream-routing-terminating-mode). |
+| `upstreams` | list of `{dial, slot_save_path?, slot_lru_max?}` | llama.cpp backends to route to, in priority order. When set, the handler becomes terminating (it no longer calls the next handler) and routes requests by model. Each entry may configure its own `slot_save_path`/`slot_lru_max`. See [Upstream routing](#upstream-routing-terminating-mode). |
 | `probe_interval` | duration | Interval between `/v1/models` probes to each upstream. Default `10s`. Requires `upstreams`. |
 | `probe_timeout` | duration | Timeout of each probe request. Default `5s`. Requires `upstreams`. |
 
@@ -181,8 +181,40 @@ Every entry also carries a `routing` field: the `dial` address of the upstream t
 ### Notes
 
 - `/v1/audio/speech` → `/tts` requests are routed to the first healthy upstream (the first upstream when none is healthy; the body's `model` field is only known after the rewrite, and re-reading the body would cost a second read).
-- Slot requests (`/slots*`) are routed the same way.
+- Slot requests (`/slots*`) are routed the same way, and are served from the slot directory of the upstream they are routed to (see [Per-upstream slot settings](#per-upstream-slot-settings)).
 - Because the handler terminates the chain, the downstream `reverse_proxy` route for the same paths is no longer needed — its `load_balancing` and `health_checks` are superseded by the probes.
+
+### Per-upstream slot settings
+
+Each upstream may configure its own `slot_save_path` and `slot_lru_max`. When an upstream sets `slot_save_path`, its `slot_lru_max` (zero = no eviction) applies to it exclusively; when it does not, the handler-level `slot_save_path`/`slot_lru_max` apply to it. This lets each backend manage its own slot directory (e.g. one NFS export per llama-server) while backends without per-upstream settings share the handler-level directory.
+
+```json
+{
+    "handler": "reasoning_effort",
+    "slot_save_path": "/var/lib/llama/slots-shared",
+    "slot_lru_max": 16,
+    "upstreams": [
+        {"dial": "example.lan:8080", "slot_save_path": "/var/lib/llama/slots-a", "slot_lru_max": 8},
+        {"dial": "backup.lan:8080"}
+    ]
+}
+```
+
+```caddyfile
+reasoning_effort {
+    slot_save_path /var/lib/llama/slots-shared
+    slot_lru_max 16
+    upstreams {
+        example.lan:8080 {
+            slot_save_path /var/lib/llama/slots-a
+            slot_lru_max 8
+        }
+        backup.lan:8080
+    }
+}
+```
+
+The flat `upstreams dial1 dial2 ...` form remains available when no per-upstream options are needed.
 
 ```json
 {
@@ -407,6 +439,7 @@ Notes:
 - `restore` of a file that is not yet tracked adds it to the LRU (and may trigger eviction of the least recently used file).
 - `action=erase` only clears llama-server's in-memory cache and leaves the file on disk, so it is passed through untouched and not tracked.
 - `slot_lru_max` of `0` (the default) tracks files and serves `delete` but never evicts.
+- In terminating mode (`upstreams` configured), the handler-level `slot_save_path`/`slot_lru_max` are the fallback for upstreams that configure no slot settings of their own; each upstream may set its own `slot_save_path`/`slot_lru_max`, which then apply to that upstream exclusively. See [Per-upstream slot settings](#per-upstream-slot-settings).
 - Filesystem access goes through an internal `SlotFS` interface with two implementations: the local filesystem (the default) and SMB shares (see below). The LRU logic is identical for both.
 
 ```caddyfile

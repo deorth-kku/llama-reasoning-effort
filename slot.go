@@ -29,14 +29,38 @@ type slotRequestBody struct {
 	Filename string `json:"filename,omitzero"`
 }
 
-// provisionSlotLRU initializes the slot file LRU from the configured
-// slot options. SlotSavePath selects the filesystem: an smb:// URL uses
-// an SMB share (via the pure-Go go-smb2 client), an nfs:// URL an NFSv4
-// export (via the pure-Go go-nfs-client), anything else a local
-// directory. It returns an error when the options are half-configured
-// (a limit without a save path) or the SMB/NFS URL is malformed. A failed
-// SMB or NFS connection is not an error: the share/export is reached on
-// first use instead.
+// newSlotFS creates the SlotFS for path: an smb:// URL uses an SMB
+// share (via the pure-Go go-smb2 client), an nfs:// URL an NFSv4 export
+// (via the pure-Go go-nfs-client), anything else a local directory. The
+// returned closer is nil for local directories and releases the SMB
+// session or NFS connection otherwise. A failed SMB or NFS connection
+// is not an error: the share/export is reached on first use instead.
+func newSlotFS(path string, log *zap.Logger) (SlotFS, io.Closer, error) {
+	if strings.HasPrefix(path, "smb://") {
+		fs, err := newSMBFSFromURL(path, log)
+		if err != nil {
+			return nil, nil, fmt.Errorf("slot_save_path: %w", err)
+		}
+		return fs, fs, nil
+	}
+	if strings.HasPrefix(path, "nfs://") {
+		fs, err := newNFSFSFromURL(path, log)
+		if err != nil {
+			return nil, nil, fmt.Errorf("slot_save_path: %w", err)
+		}
+		return fs, fs, nil
+	}
+	// Do not block startup when the directory is missing: llama-server
+	// may create it later, and the LRU load reports it and reconciles
+	// against disk.
+	return newLocalFS(path), nil, nil
+}
+
+// provisionSlotLRU initializes the handler-level slot file LRU from the
+// configured slot options. It returns an error when the options are
+// half-configured (a limit without a save path) or the SMB/NFS URL is
+// malformed. In terminating mode the instance is additionally shared
+// by every upstream that has no slot settings of its own.
 func (m *ReasoningEffort) provisionSlotLRU(log *zap.Logger) error {
 	if m.SlotLRUMax < 0 {
 		return fmt.Errorf("slot_lru_max must be >= 0, got %d", m.SlotLRUMax)
@@ -47,47 +71,37 @@ func (m *ReasoningEffort) provisionSlotLRU(log *zap.Logger) error {
 		}
 		return nil
 	}
-	if strings.HasPrefix(m.SlotSavePath, "smb://") {
-		fs, err := newSMBFSFromURL(m.SlotSavePath, log)
-		if err != nil {
-			return fmt.Errorf("slot_save_path: %w", err)
-		}
-		m.fsCloser = fs
-		m.slotLRU = newSlotLRU(fs, m.SlotLRUMax, log)
-		return nil
+	fs, closer, err := newSlotFS(m.SlotSavePath, log)
+	if err != nil {
+		return err
 	}
-	if strings.HasPrefix(m.SlotSavePath, "nfs://") {
-		fs, err := newNFSFSFromURL(m.SlotSavePath, log)
-		if err != nil {
-			return fmt.Errorf("slot_save_path: %w", err)
-		}
-		m.fsCloser = fs
-		m.slotLRU = newSlotLRU(fs, m.SlotLRUMax, log)
-		return nil
+	if closer != nil {
+		m.fsClosers = append(m.fsClosers, closer)
 	}
-	// Do not block startup when the directory is missing: llama-server
-	// may create it later, and the LRU load reports it and reconciles
-	// against disk.
-	m.slotLRU = newSlotLRU(newLocalFS(m.SlotSavePath), m.SlotLRUMax, log)
+	m.slotLRU = newSlotLRU(fs, m.SlotLRUMax, log)
 	return nil
 }
 
-// Cleanup implements caddy.CleanerUpper and releases the SMB session or
-// NFS connection when the slot features run against a remote share or
-// export.
+// Cleanup implements caddy.CleanerUpper and releases the SMB sessions
+// and NFS connections used by the slot features.
 func (m *ReasoningEffort) Cleanup() error {
-	if m.fsCloser == nil {
-		return nil
+	var err error
+	for _, c := range m.fsClosers {
+		if e := c.Close(); e != nil && err == nil {
+			err = e
+		}
 	}
-	err := m.fsCloser.Close()
-	m.fsCloser = nil
+	m.fsClosers = nil
 	return err
 }
 
 // serveSlots handles POST requests to llama-server's /slots/{id_slot}
-// endpoint. It returns handled=true when the request was fully processed
-// by this method (either forwarded to next or answered directly), and
-// handled=false when the request should be passed through untouched.
+// endpoint, using lru as the slot file LRU of the directory the request
+// is forwarded to (the handler-level LRU in middleware mode, the
+// selected upstream's LRU in terminating mode). It returns handled=true
+// when the request was fully processed by this method (either forwarded
+// to next or answered directly), and handled=false when the request
+// should be passed through untouched.
 //
 // save/restore are forwarded to the upstream immediately with the body
 // tee'd to a local copy; the LRU is updated asynchronously from that copy
@@ -95,8 +109,8 @@ func (m *ReasoningEffort) Cleanup() error {
 // llama-server has no delete action (it would answer 400 "Invalid
 // action"); the slot id in the path is ignored — delete targets a file
 // only.
-func (m *ReasoningEffort) serveSlots(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) (bool, error) {
-	if m.slotLRU == nil || r.Method != http.MethodPost || !strings.HasPrefix(r.URL.Path, slotsPathPrefix) {
+func (m *ReasoningEffort) serveSlots(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler, lru *slotLRU) (bool, error) {
+	if lru == nil || r.Method != http.MethodPost || !strings.HasPrefix(r.URL.Path, slotsPathPrefix) {
 		return false, nil
 	}
 	log := m.log
@@ -117,7 +131,7 @@ func (m *ReasoningEffort) serveSlots(w http.ResponseWriter, r *http.Request, nex
 			http.Error(w, "invalid filename", http.StatusBadRequest)
 			return true, nil
 		}
-		deleted, err := m.slotLRU.delete(req.Filename)
+		deleted, err := lru.delete(req.Filename)
 		if err != nil {
 			log.Warn("slot delete failed", zap.String("filename", req.Filename), zap.Error(err))
 			http.Error(w, "failed to delete slot file", http.StatusInternalServerError)
@@ -138,7 +152,7 @@ func (m *ReasoningEffort) serveSlots(w http.ResponseWriter, r *http.Request, nex
 		orig := r.Body
 		r.Body = &teeCloser{Reader: io.TeeReader(orig, bodyCopy), closer: orig}
 		err := next.ServeHTTP(w, r)
-		go m.slotLRU.record(bodyCopy.Bytes())
+		go lru.record(bodyCopy.Bytes())
 		return true, err
 	default:
 		// erase and anything else: pass through untouched.
@@ -156,15 +170,16 @@ type teeCloser struct {
 
 func (t *teeCloser) Close() error { return t.closer.Close() }
 
-// parseSlotOption parses the slot_save_path and slot_lru_max directives.
-// The dispenser must be positioned on the directive token.
-func (m *ReasoningEffort) parseSlotOption(d *caddyfile.Dispenser) error {
+// parseSlotOption parses the slot_save_path and slot_lru_max directives
+// into *path and *max. The dispenser must be positioned on the directive
+// token.
+func parseSlotOption(d *caddyfile.Dispenser, path *string, max *int) error {
 	switch d.Val() {
 	case "slot_save_path":
 		if !d.NextArg() {
 			return d.ArgErr()
 		}
-		m.SlotSavePath = d.Val()
+		*path = d.Val()
 	case "slot_lru_max":
 		if !d.NextArg() {
 			return d.ArgErr()
@@ -173,7 +188,7 @@ func (m *ReasoningEffort) parseSlotOption(d *caddyfile.Dispenser) error {
 		if err != nil {
 			return d.Errf("invalid slot_lru_max value '%s': %v", d.Val(), err)
 		}
-		m.SlotLRUMax = val
+		*max = val
 	}
 	return nil
 }
