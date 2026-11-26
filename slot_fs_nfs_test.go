@@ -44,6 +44,26 @@ func TestParseNFSURL(t *testing.T) {
 			want: nfsURL{server: "192.168.1.201:2049", root: "export/slots", cred: sysCredGID},
 		},
 		{
+			raw:  "nfs://192.168.1.201/export/slots?src_port=1000",
+			want: nfsURL{server: "192.168.1.201:2049", root: "export/slots", cred: nullCred, srcPort: 1000},
+		},
+		{
+			raw:  "nfs://1000:1001@192.168.1.201:2049/export/slots?src_port=80",
+			want: nfsURL{server: "192.168.1.201:2049", root: "export/slots", cred: sysCredGID, srcPort: 80},
+		},
+		{
+			raw:     "nfs://192.168.1.201/export/slots?src_port=0",
+			wantErr: true,
+		},
+		{
+			raw:     "nfs://192.168.1.201/export/slots?src_port=65536",
+			wantErr: true,
+		},
+		{
+			raw:     "nfs://192.168.1.201/export/slots?src_port=abc",
+			wantErr: true,
+		},
+		{
 			raw:     "nfs://user@192.168.1.201/export",
 			wantErr: true,
 		},
@@ -68,9 +88,9 @@ func TestParseNFSURL(t *testing.T) {
 			t.Errorf("parseNFSURL(%q): %v", tt.raw, err)
 			continue
 		}
-		if got.server != tt.want.server || got.root != tt.want.root || !credEqual(got.cred, tt.want.cred) {
-			t.Errorf("parseNFSURL(%q) = server %q root %q cred %+v, want server %q root %q cred %+v",
-				tt.raw, got.server, got.root, got.cred, tt.want.server, tt.want.root, tt.want.cred)
+		if got.server != tt.want.server || got.root != tt.want.root || got.srcPort != tt.want.srcPort || !credEqual(got.cred, tt.want.cred) {
+			t.Errorf("parseNFSURL(%q) = server %q root %q srcPort %d cred %+v, want server %q root %q srcPort %d cred %+v",
+				tt.raw, got.server, got.root, got.srcPort, got.cred, tt.want.server, tt.want.root, tt.want.srcPort, tt.want.cred)
 		}
 	}
 }

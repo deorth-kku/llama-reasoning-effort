@@ -44,33 +44,33 @@ const nfsOpTimeout = 30 * time.Second
 // renews at two-thirds of this period.
 const nfsLeasePeriod = 60 * time.Second
 
-// nfsSourcePort is the local (client-side) TCP port we bind when dialing
-// the NFS server. It must be < 1024 so the server's default `secure` export
-// option accepts our connection: nfsd checks the client's source port and
-// returns NFS4ERR_PERM on the export point for non-privileged ports. The
-// kernel NFS client satisfies this implicitly by running as root, but our
-// pure-Go client would otherwise use an ephemeral port (>1024). Caddy holds
-// CAP_NET_BIND_SERVICE (it binds 443), so binding a low port here succeeds.
-const nfsSourcePort = 1000
+// nfsSrcPortArg is the URL query argument that selects the local
+// (client-side) TCP port to bind when dialing the NFS server. When absent,
+// the OS assigns an ephemeral port.
+const nfsSrcPortArg = "src_port"
 
 // nfsURL is the parsed form of an nfs:// slot_save_path URL:
 //
-//	nfs://[[uid[:gid]@]host[:port]/[export/path/dir]]
+//	nfs://[[uid[:gid]@]host[:port]/[export/path/dir]][?src_port=N]
 //
 // The path is the directory that holds the slot files, relative to the
 // server's pseudo-root. The optional userinfo carries the AUTH_SYS
 // credential (numeric uid, and optionally gid); when absent, AUTH_NULL is
-// used.
+// used. The optional src_port argument binds the given local source port
+// when dialing (0 = ephemeral, the default).
 type nfsURL struct {
-	server string // host:port, port defaulted
-	root   string // directory under the pseudo-root, "" = pseudo-root
-	cred   rpc.OpaqueAuth
+	server  string // host:port, port defaulted
+	root    string // directory under the pseudo-root, "" = pseudo-root
+	cred    rpc.OpaqueAuth
+	srcPort int // local source port to bind when dialing, 0 = ephemeral
 }
 
 // parseNFSURL parses an nfs:// URL of the form
-// nfs://[[uid[:gid]@]host[:port]/[export/path/dir]]. The port defaults to
-// 2049. The userinfo, when present, must be a numeric uid (optionally
-// followed by :gid); gid defaults to uid.
+// nfs://[[uid[:gid]@]host[:port]/[export/path/dir]][?src_port=N]. The port
+// defaults to 2049. The userinfo, when present, must be a numeric uid
+// (optionally followed by :gid); gid defaults to uid. The src_port
+// argument, when present, must be a port number (1-65535); when absent,
+// the dial uses an ephemeral source port.
 func parseNFSURL(raw string) (*nfsURL, error) {
 	// The raw URL may carry credentials, so error messages report only
 	// the redacted form (url.Parse errors embed the input verbatim).
@@ -103,6 +103,13 @@ func parseNFSURL(raw string) (*nfsURL, error) {
 	}
 	out.server = host
 	out.root = strings.Trim(u.Path, "/")
+	if srcPort := u.Query().Get(nfsSrcPortArg); srcPort != "" {
+		p, err := strconv.ParseUint(srcPort, 10, 16)
+		if err != nil || p < 1 || p > 65535 {
+			return nil, fmt.Errorf("invalid nfs URL %q: %s must be a port number (1-65535)", redactNFSURL(raw), nfsSrcPortArg)
+		}
+		out.srcPort = int(p)
+	}
 	return out, nil
 }
 
@@ -178,10 +185,10 @@ func newNFSFSFromURL(raw string, log *zap.Logger) (*nfsFS, error) {
 	return f, nil
 }
 
-// connect dials the NFS server from a privileged source port, establishes
-// the clientid, and resolves the root directory, bounded in total by
-// nfsConnTimeout. The new connection is swapped in atomically; the previous
-// one (if any) is closed.
+// connect dials the NFS server (binding the configured source port, if
+// any), establishes the clientid, and resolves the root directory, bounded
+// in total by nfsConnTimeout. The new connection is swapped in atomically;
+// the previous one (if any) is closed.
 func (f *nfsFS) connect() error {
 	ctx, cancel := context.WithTimeout(context.Background(), nfsConnTimeout)
 	defer cancel()
@@ -205,10 +212,10 @@ func (f *nfsFS) connect() error {
 	return nil
 }
 
-// dialNFS dials the server from a privileged source port and mounts an
-// NFSv4 connection, negotiating the highest supported minor version (v4.1,
-// falling back to v4.0). The returned connection is open and owned by the
-// caller.
+// dialNFS dials the server (binding the configured source port, if any)
+// and mounts an NFSv4 connection, negotiating the highest supported minor
+// version (v4.1, falling back to v4.0). The returned connection is open
+// and owned by the caller.
 func (f *nfsFS) dialNFS(ctx context.Context) (*nfs4.Conn, error) {
 	for _, minor := range []uint32{nfs4.MinorV41, nfs4.MinorV40} {
 		conn, err := f.dialNFSVersion(ctx, minor)
@@ -223,15 +230,21 @@ func (f *nfsFS) dialNFS(ctx context.Context) (*nfs4.Conn, error) {
 	return nil, fmt.Errorf("dial %s: minor version negotiation failed", f.cfg.server)
 }
 
-// dialNFSVersion dials the server from the privileged source port and
-// mounts with the given NFSv4 minor version. On failure the TCP connection
-// is closed and the error returned.
+// dialNFSVersion dials the server and mounts with the given NFSv4 minor
+// version. When the URL carries a src_port argument, the dial binds that
+// local source port; otherwise the OS assigns an ephemeral one. On failure
+// the TCP connection is closed and the error returned.
 func (f *nfsFS) dialNFSVersion(ctx context.Context, minor uint32) (*nfs4.Conn, error) {
-	local := &net.TCPAddr{Port: nfsSourcePort}
-	d := net.Dialer{LocalAddr: local}
+	d := net.Dialer{}
+	if f.cfg.srcPort > 0 {
+		d.LocalAddr = &net.TCPAddr{Port: f.cfg.srcPort}
+	}
 	tcpConn, err := d.DialContext(ctx, "tcp", f.cfg.server)
 	if err != nil {
-		return nil, fmt.Errorf("dial %s from local port %d: %w", f.cfg.server, nfsSourcePort, err)
+		if f.cfg.srcPort > 0 {
+			return nil, fmt.Errorf("dial %s from local port %d: %w", f.cfg.server, f.cfg.srcPort, err)
+		}
+		return nil, fmt.Errorf("dial %s: %w", f.cfg.server, err)
 	}
 	if tc, ok := tcpConn.(*net.TCPConn); ok {
 		tc.SetNoDelay(true)

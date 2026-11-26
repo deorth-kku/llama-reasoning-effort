@@ -475,12 +475,15 @@ example.com {
 `slot_save_path` also accepts an `nfs://` URL, in which case the plugin manages the slot files on an NFSv4 export through a pure-Go NFSv4 client (no local mount of the export is required — useful when Caddy runs on a different host than llama-server, which accesses the same directory through its own mount):
 
 ```
-nfs://[[uid[:gid]@]host[:port]/[export/path/dir]]
+nfs://[[uid[:gid]@]host[:port]/[export/path/dir]][?src_port=N]
 ```
 
 - `host` is the NFS server address; `port` defaults to `2049`. NFSv4 uses a single well-known port — no portmapper (rpcbind) lookup is performed by the client.
 - The path is the directory that holds the slot files, relative to the server's pseudo-root (the export path plus any subdirectory), e.g. `nfs://192.168.1.201/export/llama/slots`. An empty path addresses the pseudo-root itself.
 - `uid`/`gid` are optional and select the AUTH_SYS credential sent with every request (NFS has no username/password; the server authenticates by numeric uid/gid). When omitted, AUTH_NULL is used. `gid` defaults to `uid`.
+- By default the client dials from an **ephemeral (high) source port**. If the export line on the server uses the default `secure` option, nfsd requires the client's source port to be < 1024 and otherwise returns `NFS4ERR_PERM` on the export point. Pick one of:
+  - **Server side:** add `insecure` to the export line in `/etc/exports` (then `exportfs -ra`), accepting connections from any source port; or
+  - **Client side:** specify a privileged source port in the URL, e.g. `nfs://host/export/llama/slots?src_port=1000` (`src_port` accepts 1–65535). Binding a port < 1024 requires the process to run as root or hold `CAP_NET_BIND_SERVICE` — Caddy already holds it.
 - The minor version is negotiated automatically (v4.1 is attempted first, falling back to v4.0).
 - The connection is attempted at startup, bounded by a 15 second timeout. If the server is unreachable (or the directory or credentials are bad), startup is not blocked: the LRU state is loaded in the background after startup (and retried on the first slot save/restore if that load fails), which retrieves the connection.
 - A file operation that fails because the connection broke reconnects once and retries the operation.
