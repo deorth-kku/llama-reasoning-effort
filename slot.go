@@ -31,10 +31,12 @@ type slotRequestBody struct {
 
 // provisionSlotLRU initializes the slot file LRU from the configured
 // slot options. SlotSavePath selects the filesystem: an smb:// URL uses
-// an SMB share (via the pure-Go go-smb2 client), anything else a local
+// an SMB share (via the pure-Go go-smb2 client), an nfs:// URL an NFSv4
+// export (via the pure-Go go-nfs-client), anything else a local
 // directory. It returns an error when the options are half-configured
-// (a limit without a save path) or the SMB URL is malformed. A failed SMB
-// connection is not an error: the share is reached on first use instead.
+// (a limit without a save path) or the SMB/NFS URL is malformed. A failed
+// SMB or NFS connection is not an error: the share/export is reached on
+// first use instead.
 func (m *ReasoningEffort) provisionSlotLRU(log *zap.Logger) error {
 	if m.SlotLRUMax < 0 {
 		return fmt.Errorf("slot_lru_max must be >= 0, got %d", m.SlotLRUMax)
@@ -54,6 +56,15 @@ func (m *ReasoningEffort) provisionSlotLRU(log *zap.Logger) error {
 		m.slotLRU = newSlotLRU(fs, m.SlotLRUMax, log)
 		return nil
 	}
+	if strings.HasPrefix(m.SlotSavePath, "nfs://") {
+		fs, err := newNFSFSFromURL(m.SlotSavePath, log)
+		if err != nil {
+			return fmt.Errorf("slot_save_path: %w", err)
+		}
+		m.fsCloser = fs
+		m.slotLRU = newSlotLRU(fs, m.SlotLRUMax, log)
+		return nil
+	}
 	// Do not block startup when the directory is missing: llama-server
 	// may create it later, and the LRU load reports it and reconciles
 	// against disk.
@@ -61,8 +72,9 @@ func (m *ReasoningEffort) provisionSlotLRU(log *zap.Logger) error {
 	return nil
 }
 
-// Cleanup implements caddy.CleanerUpper and releases the SMB session when
-// the slot features run against an SMB share.
+// Cleanup implements caddy.CleanerUpper and releases the SMB session or
+// NFS connection when the slot features run against a remote share or
+// export.
 func (m *ReasoningEffort) Cleanup() error {
 	if m.fsCloser == nil {
 		return nil

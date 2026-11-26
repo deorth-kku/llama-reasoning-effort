@@ -17,7 +17,7 @@ type SlotFileInfo struct {
 // SlotFS abstracts the file operations the slot LRU performs on the
 // directory that holds llama-server's slot save files. All names are
 // relative to that directory. The interface exists so the LRU logic never
-// touches the OS directly; a future NFS/SMB implementation (pure-Go
+// touches the OS directly; remote implementations (SMB and NFS, pure-Go
 // user-space clients, since Caddy may run on a different host than
 // llama-server) can be dropped in without touching the LRU or middleware.
 //

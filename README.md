@@ -81,7 +81,7 @@ Or use JSON config:
 | `voice` | string → string | Maps an OpenAI-style voice name to a local speaker reference audio file, for `/v1/audio/speech` requests. See [OpenAI-compatible /v1/audio/speech](#openai-compatible-v1audiospeech). |
 | `model_configs` | model name → config | Per-model overrides. Each entry supports the same `map`, `to_chat_template_key`, `logit_bias`, `remove`, and `hooks` options as the top level. |
 | `hooks` | hook → config | (Top level) An ordered list of hooks fired for every matching request. See [Hooks](#hooks). |
-| `slot_save_path` | string | Where llama-server's slot save files live: a local directory (llama-server's `--slot-save-path`) or an `smb://` URL pointing at the same directory on an SMB share. Setting it enables the slot file LRU and the `action=delete` handler. See [Slot file LRU and delete](#slot-file-lru-and-delete). |
+| `slot_save_path` | string | Where llama-server's slot save files live: a local directory (llama-server's `--slot-save-path`), an `smb://` URL pointing at the same directory on an SMB share, or an `nfs://` URL pointing at it on an NFSv4 export. Setting it enables the slot file LRU and the `action=delete` handler. See [Slot file LRU and delete](#slot-file-lru-and-delete). |
 | `slot_lru_max` | int | Maximum number of tracked slot save files. Zero (default) tracks files without evicting. Requires `slot_save_path`. |
 | `upstreams` | list of `{dial}` | llama.cpp backends to route to, in priority order. When set, the handler becomes terminating (it no longer calls the next handler) and routes requests by model. See [Upstream routing](#upstream-routing-terminating-mode). |
 | `probe_interval` | duration | Interval between `/v1/models` probes to each upstream. Default `10s`. Requires `upstreams`. |
@@ -465,6 +465,46 @@ example.com {
         "matcher": {"path": ["/slots/*"]},
         "handler": "reasoning_effort",
         "slot_save_path": "smb://user:password@192.168.1.200/share/llama/slots",
+        "slot_lru_max": 16
+    }]
+}
+```
+
+### NFSv4 exports
+
+`slot_save_path` also accepts an `nfs://` URL, in which case the plugin manages the slot files on an NFSv4 export through a pure-Go NFSv4 client (no local mount of the export is required — useful when Caddy runs on a different host than llama-server, which accesses the same directory through its own mount):
+
+```
+nfs://[[uid[:gid]@]host[:port]/[export/path/dir]]
+```
+
+- `host` is the NFS server address; `port` defaults to `2049`. NFSv4 uses a single well-known port — no portmapper (rpcbind) lookup is performed by the client.
+- The path is the directory that holds the slot files, relative to the server's pseudo-root (the export path plus any subdirectory), e.g. `nfs://192.168.1.201/export/llama/slots`. An empty path addresses the pseudo-root itself.
+- `uid`/`gid` are optional and select the AUTH_SYS credential sent with every request (NFS has no username/password; the server authenticates by numeric uid/gid). When omitted, AUTH_NULL is used. `gid` defaults to `uid`.
+- The minor version is negotiated automatically (v4.1 is attempted first, falling back to v4.0).
+- The connection is attempted at startup, bounded by a 15 second timeout. If the server is unreachable (or the directory or credentials are bad), startup is not blocked: the LRU state is loaded in the background after startup (and retried on the first slot save/restore if that load fails), which retrieves the connection.
+- A file operation that fails because the connection broke reconnects once and retries the operation.
+- A missing directory inside the export is tolerated (it may be created later by llama-server).
+- Each NFS file operation is bounded by a 30 second timeout, so an unreachable server does not stall requests.
+- A background RENEW loop keeps the NFSv4 lease alive so open stateids are not reclaimed by the server.
+
+```caddyfile
+example.com {
+    handle /slots/* {
+        reasoning_effort {
+            slot_save_path nfs://1000:1000@192.168.1.201/export/llama/slots
+            slot_lru_max 16
+        }
+    }
+}
+```
+
+```json
+{
+    "handle": [{
+        "matcher": {"path": ["/slots/*"]},
+        "handler": "reasoning_effort",
+        "slot_save_path": "nfs://1000:1000@192.168.1.201/export/llama/slots",
         "slot_lru_max": 16
     }]
 }
